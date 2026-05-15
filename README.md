@@ -14,7 +14,7 @@ The core philosophy is maximum local efficiency. By utilizing **vLLM** and **Qdr
 
 - **LLM Engine (GPT-OSS-20B):** ~14 GB.
     
-- **Embedding Engine (BGE-Large-En-v1.5):** ~4 GB.
+- **Embedding Engine (BGE-Large-En-v1.5):** ~2 GB.
     
 - **KV Cache & Context Window (32k):** ~9 GB.
     
