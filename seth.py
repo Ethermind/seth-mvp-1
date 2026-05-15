@@ -222,7 +222,7 @@ class SethEngine:
     """Inference engine with Function Calling and Data Synthesis support."""
     def __init__(self, env: SethEnvironment):
         self.env = env
-        self.client = openai.OpenAI(base_url=env.vllm_url, api_key="EMPTY")
+        self.client = openai.AsyncOpenAI(base_url=env.vllm_url, api_key="EMPTY")
         self.search_tool = SethSearchTool()
 
     def _get_tools(self) -> List[Dict]:
@@ -249,7 +249,7 @@ class SethEngine:
         # Fallback mechanism for models with limited Tool-Call support
         if use_tools and not choice.message.content:
             tmp_msg = messages + [{"role": "user", "content": "Return ONLY a search query in <query>...</query>"}]
-            resp = self.client.chat.completions.create(model=self.env.llm_model, messages=tmp_msg, temperature=0)
+            resp = await self.client.chat.completions.create(model=self.env.llm_model, messages=tmp_msg, temperature=0)
             match = re.search(r'<query>(.*?)</query>', resp.choices[0].message.content)
             if match: return await self.search_tool.search(match.group(1))
         
@@ -263,7 +263,7 @@ class SethEngine:
         messages = [{"role": "system", "content": system_prompt}] + list(history) + [{"role": "user", "content": user_input}]
 
         try:
-            resp = self.client.chat.completions.create(
+            resp = await self.client.chat.completions.create(
                 model=self.env.llm_model,
                 messages=messages,
                 tools=self._get_tools() if use_tools else None,
