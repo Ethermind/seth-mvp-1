@@ -272,7 +272,7 @@ class SethEngine:
 
             search_data = await self._handle_search_flow(resp.choices[0], messages, use_tools)
             if search_data:
-                return self._synthesize(user_input, search_data, history)
+                return await self._synthesize(user_input, search_data, history)
 
             return resp.choices[0].message.content or "Error: Empty inference generated."
 
@@ -280,18 +280,20 @@ class SethEngine:
             logging.error(f"Engine Exception: {e}")
             return f"Inference Circuit Break: {str(e)}"
 
-    def _synthesize(self, user_input: str, data: str, history: deque) -> str:
+    async def _synthesize(self, user_input: str, data: str, history: deque) -> str:
         """Synthesizes the final response by injecting retrieved web data into context."""
         messages = [
             {"role": "system", "content": f"You are SETH. Synthesize this data into a coherent response:\n{data}"},
             *list(history)[-3:], 
             {"role": "user", "content": user_input}
         ]
-        return self.client.chat.completions.create(
-            model=self.env.llm_model, 
-            messages=messages, 
+        resp = await self.client.chat.completions.create(
+            model=self.env.llm_model,
+            messages=messages,
             temperature=0.4
-        ).choices[0].message.content
+        )
+
+        return resp.choices[0].message.content
 
 class SethTelegramBot:
     """Telegram interface and memory orchestration layer."""
