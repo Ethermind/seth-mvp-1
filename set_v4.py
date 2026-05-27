@@ -15,6 +15,35 @@ DESCRIPTION:
     cross-session recollection.
 
     "The noise of the void, structured into code."
+
+fix: MVP-2 stabilization TODOs before merge
+
+CRITICAL (breaks runtime):
+- [ ] SethTelegramBot references self.embedding_engine which doesn't exist
+      → inject it via constructor or pull from SethMemoryTool.memory.embedding_model
+- [ ] SethDynamicRegulator is instantiated but never wired to SethChatBot.ask()
+      → pass regulator.update(query) result as extra kwargs to the LLM call
+
+HIGH (breaks multi-user):
+- [ ] user_id hardcoded as 123 in top-level tool functions (web_search, retrieve_long_term_memory, save_long_term_memory)
+      → thread user_id through tool call context or use a per-request closure
+
+MEDIUM (silent failures):
+- [ ] SethDynamicRegulator.update() result (temperature, top_p, etc.) is computed but discarded
+      → apply returned config dict to the completions.create() call
+- [ ] _send_long_message() is defined in SethTelegramBot but never called in process()
+      → replace reply_text(seth_response) with _send_long_message()
+- [ ] save_long_term_memory is a registered tool but the LLM decides when to call it
+      → consider forcing a save after every meaningful exchange or add an explicit post-hook
+
+LOW (nice to have):
+- [ ] SethMemoryTool is re-instantiated on every tool call (cold Qdrant connection each time)
+      → lift instance to bot constructor and reuse
+- [ ] No conversation history passed to SethChatBot.ask() across turns
+      → add short-term history deque similar to MVP-1 SethMemory
+- [ ] SethEnvironment.validate() is called inside run() but client/tools are built before it
+      → move validate() call to main() before constructing anything
+      
 ====================================================================================================
 """
 
@@ -344,25 +373,27 @@ class SethChatBot:
         self.env = SethEnvironment()
 
     async def send(self, user_text: str, use_tools: bool = True) -> str:
-        tools = self.tools_manager.as_vllm_format() if (use_tools and self.tools_manager) else None
-        
         messages = [{"role": "user", "content": user_text}]
+        return await self.ask(messages, use_tools=use_tools)
 
-        def _sync_call(current_messages):
+    async def ask(self, messages: str, use_tools: bool = True) -> str:
+        tools = self.tools_manager.as_vllm_format() if (use_tools and self.tools_manager) else None
+
+        def _sync_call(messages):
+            logging.info("🧠 Sending message to LLM with tool options = [{tools}]".format(tools="Yes" if tools else "No"))
+
             if tools:
-                logging.info("🧠 Sending message to LLM with tool options...")
                 return self.client.chat.completions.create(
                     model=self.env.llm_model,
-                    messages=current_messages,
+                    messages=messages,
                     tools=tools,
                     tool_choice="auto"
                 )
-            else:
-                logging.info("🧠 Sending message to LLM without tools...")
-                return self.client.chat.completions.create(
-                    model=self.env.llm_model,
-                    messages=current_messages
-                )
+
+            return self.client.chat.completions.create(
+                model=self.env.llm_model,
+                messages=messages
+            )
 
         response = await asyncio.to_thread(_sync_call, messages)
         choice = response.choices[0]
@@ -401,7 +432,6 @@ class SethChatBot:
             final_response = await asyncio.to_thread(_sync_call, messages)
             return final_response.choices[0].message.content
 
-        # Si no requirió herramientas, devolvemos la respuesta de texto directa
         return message.content
     
 
@@ -486,25 +516,18 @@ class SethTelegramBot(SethChatBot):
     """Bridges SethChatBot logic directly to Telegram events via inheritance."""
     def __init__(self, client: OpenAI, tools_manager: ToolsManager | None = None):
         super().__init__(client, tools_manager)
+        self.regulator: SethDynamicRegulator = SethDynamicRegulator(SethPresets.DEFAULT, self.embedding_engine)
         
     async def start_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text("--- SETH ONLINE ---")
+        await update.message.reply_text("--- SETH ONLINE (NOT INTENDED FOR MULTIPLE USERS OR PRODUCTION USE)---")
 
     async def process(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Intercepts all incoming text messages from Telegram and routes through SETH."""
-        global CURRENT_USER_ID
-        
         user_text = update.message.text
-        # Seteamos dinámicamente el id del usuario que habla para el scope de las herramientas de memoria
-        CURRENT_USER_ID = str(update.message.from_user.id)
-        
-        logging.info(f"📩 Telegram msg received from {CURRENT_USER_ID}: '{user_text}'")
-        
-        # Avisamos que SETH está procesando (Type Action)
+
         await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
         
         try:
-            # Reutiliza el método .send() heredado del core original
             seth_response = await self.send(user_text, use_tools=True)
             await update.message.reply_text(seth_response)
         except Exception as e:
