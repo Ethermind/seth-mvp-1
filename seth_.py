@@ -21,16 +21,12 @@ fix: MVP-2 stabilization TODOs before merge
 CRITICAL (breaks runtime):
 - [ ] SethTelegramBot references self.embedding_engine which doesn't exist
       → inject it via constructor or pull from SethMemoryTool.memory.embedding_model
-- [ ] SethDynamicRegulator is instantiated but never wired to SethChatBot.ask()
-      → pass regulator.update(query) result as extra kwargs to the LLM call
 
 HIGH (breaks multi-user):
 - [ ] user_id hardcoded as 123 in top-level tool functions (web_search, retrieve_long_term_memory, save_long_term_memory)
       → thread user_id through tool call context or use a per-request closure
 
 MEDIUM (silent failures):
-- [ ] SethDynamicRegulator.update() result (temperature, top_p, etc.) is computed but discarded
-      → apply returned config dict to the completions.create() call
 - [ ] save_long_term_memory is a registered tool but the LLM decides when to call it
       → consider forcing a save after every meaningful exchange or add an explicit post-hook
 
@@ -176,7 +172,7 @@ class SethMemoryTool:
         mem0_config = {
             "llm": {
                 "provider": "openai", 
-                "config": {"model": env.llm_model, "openai_base_url": env.vllm_url, "api_key": "YourMammaNaked"}
+                "config": {"model": env.llm_model, "openai_base_url": env.vllm_url, "api_key": "dummy_key"}
             },
             "embedder": {
                 "provider": "huggingface", 
@@ -191,7 +187,6 @@ class SethMemoryTool:
                     "embedding_model_dims": env.embedding_dims
                 }
             },
-            #TODO: right now this is a crap and I dont even know if it works :P
             "custom_instructions": """
             Extract from the system architecture, programming, and research conversations:
             - Core conceptual definitions, original theories, and philosophical theses.
@@ -207,16 +202,20 @@ class SethMemoryTool:
         }
         self.memory = Memory.from_config(mem0_config)
 
-    def retrieve_long_term_memory(self, query: str) -> str:
-        """Retrieve and format long-term memory entries for a user."""
-        try:
-            raw_retrieval = self.memory.search(
+    async def retrieve_long_term_memory(self, query: str) -> str:
+        """Retrieve and format long-term memory entries asynchronously without blocking the loop."""
+        def _sync_search():
+            return self.memory.search(
                 query,
                 filters={"user_id": str(self.user_id)},
                 limit=10,
             )
+
+        try:
+            raw_retrieval = await asyncio.to_thread(_sync_search)
             
-            records = sorted(raw_retrieval.get("results", []), key=lambda x: x.get("score", 0), reverse=True)
+            results = raw_retrieval if isinstance(raw_retrieval, list) else raw_retrieval.get("results", [])
+            records = sorted(results, key=lambda x: x.get("score", 0), reverse=True)
             
             facts = [f"- {r['memory'].strip()}" for r in records if r.get("memory")]
             long_term_context = "\n".join(facts) if facts else "No historical records found for this interlocutor."
@@ -227,23 +226,23 @@ class SethMemoryTool:
 
         return f"<MEMORY>\n{long_term_context}\n</MEMORY>\n\n"
 
-    def save_long_term_memory(self, user_input: str, response: str) -> Dict[str, Any]:
-        """Persist a memory item to the vector store.
+    async def save_long_term_memory(self, user_input: str, response: str) -> Dict[str, Any]:
+        """Persist a memory item to the vector store asynchronously."""
+        expiration = (datetime.now() + timedelta(days=14)).strftime("%Y-%m-%d")
 
-        Returns a dict with operation status and stored record metadata.
-        """
+        def _sync_add():
+            return self.memory.add(
+                [
+                    {"role": "user", "content": user_input},
+                    {"role": "assistant", "content": response},
+                ],
+                user_id=str(self.user_id),
+                agent_id="SETH",
+                metadata={"memory_bucket": "constraints", "expires_on": expiration},
+            )
+
         try:
-            expiration = (datetime.now() + timedelta(days=14)).strftime("%Y-%m-%d")
-            res =self.memory.add(
-                    [
-                        {"role": "user", "content": user_input},
-                        {"role": "assistant", "content": response},
-                    ],
-                    user_id=str(self.user_id),
-                    agent_id="SETH",
-                    metadata={"memory_bucket": "constraints", "expires_on": expiration},
-                )
-
+            res = await asyncio.to_thread(_sync_add)
             return {"status": "ok", "result": res}
         except Exception as e:
             logging.exception(f"Failed to save memory for user {self.user_id}: {e}")
@@ -291,17 +290,16 @@ SEARCH = SethSearchTool()
 
 async def retrieve_long_term_memory(query):
     logging.info(f"🌐 Retrieving long-term memory for query: {query}")
-    return MEMORY.retrieve_long_term_memory(query=query)
+    return await MEMORY.retrieve_long_term_memory(query=query)
 
 
 async def save_long_term_memory(user_input: str, response:str):
     logging.info(f"🌐 Saving long-term memory for user_input: {user_input}, response: {response}")
-    return MEMORY.save_long_term_memory(user_input=user_input, response=response)
+    return await MEMORY.save_long_term_memory(user_input=user_input, response=response)
 
 async def web_search(query):
     logging.info(f"🌐 Crawling the web for: {query}")
-    return SEARCH.search(query)
-
+    return await SEARCH.search(query)
 
 
 class ToolRegistry:
@@ -429,83 +427,6 @@ class SethChatBot:
         return message.content
     
 
-@dataclass
-class SethState:
-    """Represents the agent's dynamic inference state (Temperature, Tokens, etc.)."""
-    temperature: float
-    max_tokens: int
-    top_p: float
-    presence_penalty: float
-
-    def interpolate(self, target: 'SethState', alpha: float):
-        """Smoothly shifts the semantic state towards a specific target behavior."""
-        self.temperature += alpha * (target.temperature - self.temperature)
-        self.top_p += alpha * (target.top_p - self.top_p)
-        self.presence_penalty += alpha * (target.presence_penalty - self.presence_penalty)
-        new_tokens = self.max_tokens + alpha * (target.max_tokens - self.max_tokens)
-        self.max_tokens = int(new_tokens)
-
-    def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
-    
-    
-class SethPresets:
-    """Standardized behavioral states for the SETH ecosystem."""
-    DEFAULT = SethState(temperature=0.25, max_tokens=1024, top_p=0.85, presence_penalty=0.2)
-    
-    @classmethod
-    def rigorous(cls) -> SethState:
-        """High precision, low temperature for code and architecture tasks."""
-        return SethState(0.1, 2000, 0.7, 0.0)
-
-    @classmethod
-    def chaotic(cls) -> SethState:
-        """High entropy for creative glitch-philosophy and humor."""
-        return SethState(1.3, 1000, 0.99, 0.9)
-
-    @classmethod
-    def verbose(cls) -> SethState:
-        """Extended context for long-form essays and deep analysis."""
-        return SethState(0.85, 4096, 0.95, 0.4)
-
-
-class SethDynamicRegulator:
-    """Orchestrates semantic state shifts based on real-time query intent."""
-    def __init__(self, state: SethState, embedding_engine, alpha=0.2):
-        self.embedding_engine = embedding_engine
-        self.alpha = alpha
-        self.current_state = state 
-        
-        # Reference vectors for SETH's behavioral modes
-        self.targets = {
-            "rigorous": {
-                "vector": self.embedding_engine.encode("Technical architecture, code precision, logic, systems design"),
-                "state": SethPresets.rigorous()
-            },
-            "chaotic": {
-                "vector": self.embedding_engine.encode("Glitch aesthetics, humor, creative chaos, fertile glitch"),
-                "state": SethPresets.chaotic()
-            },
-            "verbose": {
-                "vector": self.embedding_engine.encode("Deep philosophy, ontological analysis, long essay, legacy"),
-                "state": SethPresets.verbose()
-            }
-        }
-
-    def update(self, query: str) -> Dict[str, Any]:
-        """Calculates the best-fit behavioral mode and updates the current state."""
-        q_vec = self.embedding_engine.encode(query)
-        best_name, _ = max(
-            ((n, np.dot(q_vec, d["vector"]) / (np.linalg.norm(q_vec) * np.linalg.norm(d["vector"]))) 
-             for n, d in self.targets.items()), 
-            key=lambda x: x[1]
-        )
-        self.current_state.interpolate(self.targets[best_name]["state"], self.alpha)
-        logging.info(f"🌀 STATE ADJUSTMENT - New Temp: {self.current_state.temperature:.3f} | Top_p: {self.current_state.top_p:.3f}")
-
-        return self.current_state.to_dict()
-
-
 class SethShortMemory:
     """Manages short-term conversational context window using an atomic sliding queue."""
     def __init__(self, env: SethEnvironment, max_history: int = 40):
@@ -544,8 +465,6 @@ class SethTelegramBot(SethChatBot):
         super().__init__(client, tools_manager)
         self.short_memory = SethShortMemory(self.env)
         self.system_prompt = self.short_memory.system_prompt()
-        #TODO: this regulator sucks..
-        #self.regulator: SethDynamicRegulator = SethDynamicRegulator(SethPresets.DEFAULT, self.embedding_engine)
         
     async def start_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("--- SETH ONLINE (NOT INTENDED FOR MULTIPLE USERS OR PRODUCTION USE)---")
