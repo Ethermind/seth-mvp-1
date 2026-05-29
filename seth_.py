@@ -10,31 +10,35 @@ DESCRIPTION:
     SETH-in-a-Box MVP uses Telegram as a real-time interface to demonstrate a self-regulating 
     and tool-augmented agent capable of.
     The use is intended for a single user (myself) to interact with the agent, ask questions, 
-    and receive responses that
+    and receive responses. 
 ====================================================================================================
 """
 
+# 1. Standard Library Imports
 import asyncio
-from dataclasses import asdict, dataclass
+from collections import deque
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta
 import json
 import logging
 import os
-import copy
 import re
 import time
 from typing import Any, Dict
-from collections import deque
 
-from crawl4ai import AsyncWebCrawler, BrowserConfig, CacheMode, CrawlerRunConfig
+# 2. Third-Party Imports (General & Infrastructure)
 from ddgs import DDGS
-import numpy as np
 from dotenv import load_dotenv
-from mem0 import Memory
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
+
+# 3. AI, LLM & Heavy Infrastructure Frameworks
+from crawl4ai import AsyncWebCrawler, BrowserConfig, CacheMode, CrawlerRunConfig
+from mem0 import Memory
 from openai import AsyncOpenAI
 from sentence_transformers import SentenceTransformer
+import torch
+
 
 load_dotenv()
 
@@ -147,6 +151,7 @@ class SethMemoryTool:
         self.collection_name = collection_name
         self.static_user_id = "seth_core_user"
 
+        # Configuration for the memory layer. Initialization deferred below.
         mem0_config = {
             "llm": {
                 "provider": "openai", 
@@ -178,12 +183,21 @@ class SethMemoryTool:
             Return JSON with key "facts" as a list of strings (use [] if nothing to store).
             """
         }
-        self.memory = Memory.from_config(mem0_config)
+        # Defer heavy Memory initialization until first use to avoid blocking startup.
+        self._mem_config = mem0_config
+        self._memory = None
+
+    def _init_memory(self):
+        """Synchronous initializer for the Memory instance (safe to call inside threads)."""
+        if self._memory is None:
+            self._memory = Memory.from_config(self._mem_config)
+        return self._memory
 
     async def retrieve_long_term_memory(self, query: str) -> str:
         """Retrieve and format long-term memory entries asynchronously without blocking."""
         def _sync_search():
-            return self.memory.search(
+            mem = self._init_memory()
+            return mem.search(
                 query,
                 filters={"user_id": self.static_user_id},
                 limit=10,
@@ -208,7 +222,8 @@ class SethMemoryTool:
         expiration = (datetime.now() + timedelta(days=14)).strftime("%Y-%m-%d")
 
         def _sync_add():
-            return self.memory.add(
+            mem = self._init_memory()
+            return mem.add(
                 [
                     {"role": "user", "content": user_input},
                     {"role": "assistant", "content": response},
@@ -314,33 +329,34 @@ class SethDynamicRegulator:
     
     Optimized to load local weights and cache behavioral target anchors.
     """
-    def __init__(self, state: Any, model_path: str = "BAAI/bge-large-en-v1.5", alpha: float = 0.2):
+    def __init__(self, state: Any, env: SethEnvironment, alpha: float = 0.2):
+        self.env = env
         self.alpha = alpha
         self.current_state = state 
         
-        logging.info(f"💾 Loading Embedding Engine from: {model_path}")
-        self.engine = SentenceTransformer(model_path)
+        logging.info(f"💾 Loading Embedding Engine from: {self.env.embedding_model}")
+        self.engine = SentenceTransformer(self.env.embedding_model)
         
         self.targets = {
             "rigorous": {
-                "vector": self.engine.encode("Technical architecture, code precision, logic, systems design", normalize_embeddings=True),
+                "vector": self.engine.encode("Technical architecture, code precision, logic, systems design", convert_to_tensor=True, normalize_embeddings=True),
                 "state": SethPresets.rigorous()
             },
             "chaotic": {
-                "vector": self.engine.encode("Glitch aesthetics, humor, creative chaos, fertile glitch", normalize_embeddings=True),
+                "vector": self.engine.encode("Glitch aesthetics, humor, creative chaos, fertile glitch", convert_to_tensor=True,normalize_embeddings=True),
                 "state": SethPresets.chaotic()
             },
             "verbose": {
-                "vector": self.engine.encode("Deep philosophy, ontological analysis, long essay, legacy", normalize_embeddings=True),
+                "vector": self.engine.encode("Deep philosophy, ontological analysis, long essay, legacy", convert_to_tensor=True, normalize_embeddings=True),
                 "state": SethPresets.verbose()
             }
         }
 
     def adjust_regulated_config(self, query: str) -> Dict[str, Any]:
-        q_vec = self.engine.encode(query, normalize_embeddings=True)
+        q_vec = self.engine.encode(query, convert_to_tensor=True, normalize_embeddings=True)
         
         best_name, _ = max(
-            ((n, np.dot(q_vec, d["vector"])) for n, d in self.targets.items()), 
+            ((n, torch.dot(q_vec, d["vector"]).item()) for n, d in self.targets.items()), 
             key=lambda x: x[1]
         )
 
@@ -440,7 +456,8 @@ class SethChatBot:
         
         return re.sub(pattern, '💾 ', text, flags=re.DOTALL | re.IGNORECASE)
 
-    def _serialize_completion_message(self, message: Any) -> dict:
+    @staticmethod
+    def _serialize_completion_message(message: Any) -> dict:
         """
         Converts an OpenAI ChatCompletionMessage into a flat dictionary
         strictly compatible with vLLM chat templates.
@@ -461,7 +478,7 @@ class SethChatBot:
                     "type": "function",
                     "function": {
                         "name": tc.function.name,
-                        "bytes" if hasattr(tc.function, 'bytes') else "arguments": tc.function.arguments
+                        "arguments": tc.function.arguments
                     }
                 } for tc in tool_calls
             ]
@@ -629,7 +646,7 @@ def main():
     )
 
     client = AsyncOpenAI(base_url=env.vllm_url, api_key="dummy")
-    regulator = SethDynamicRegulator(state=copy.deepcopy(SethPresets.DEFAULT))
+    regulator = SethDynamicRegulator(state=replace(SethPresets.DEFAULT), env=env)
 
     bot_ui = SethTelegramBot(client=client, env=env, tools_manager=tools_manager, regulator=regulator)
     bot_ui.run()
