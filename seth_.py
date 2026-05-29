@@ -31,16 +31,12 @@ HIGH (breaks multi-user):
 MEDIUM (silent failures):
 - [ ] SethDynamicRegulator.update() result (temperature, top_p, etc.) is computed but discarded
       → apply returned config dict to the completions.create() call
-- [ ] _send_long_message() is defined in SethTelegramBot but never called in process()
-      → replace reply_text(seth_response) with _send_long_message()
 - [ ] save_long_term_memory is a registered tool but the LLM decides when to call it
       → consider forcing a save after every meaningful exchange or add an explicit post-hook
 
 LOW (nice to have):
 - [ ] SethMemoryTool is re-instantiated on every tool call (cold Qdrant connection each time)
       → lift instance to bot constructor and reuse
-- [ ] No conversation history passed to SethChatBot.ask() across turns
-      → add short-term history deque similar to MVP-1 SethMemory
 - [ ] SethEnvironment.validate() is called inside run() but client/tools are built before it
       → move validate() call to main() before constructing anything
       
@@ -65,7 +61,7 @@ import numpy as np
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
 from openai import OpenAI
-
+from collections import deque
 
 load_dotenv()
 
@@ -83,33 +79,13 @@ class SethEnvironment:
     telegram_token: str = os.getenv("TELEGRAM_TOKEN", "")
     embedding_model: str = os.getenv("EMBEDDING_MODEL", "BAAI/bge-large-en-v1.5")
     embedding_dims: int = int(os.getenv("EMBEDDING_MODEL_DIMS", 1024))
-    soul_path: str = "seth.md"
+    system_prompt_path: str = "seth.md"
     qdrant_host: str = os.getenv("QDRANT_HOST", "localhost")
     qdrant_port: int = int(os.getenv("QDRANT_PORT", 6333))
 
     def validate(self):
         if not self.telegram_token:
             raise ValueError("❌ TELEGRAM_TOKEN is missing in the environment.")
-
-
-async def web_search(query):
-    logging.info(f"🌐 Crawling the web for: {query}")
-    return await SethSearchTool().search(query)
-
-
-async def retrieve_long_term_memory(query):
-    user_id = 123
-    logging.info(f"🌐 Retrieving long-term memory for user: {user_id}, query: {query}")
-    memory = SethMemoryTool(user_id=user_id, collection_name="TEST", env=SethEnvironment())
-    return memory.retrieve_long_term_memory(query=query)
-
-
-async def save_long_term_memory(user_input: str, response:str):
-    user_id = 123
-    logging.info(f"🌐 Saving long-term memory for user: {user_id}, user_input: {user_input}, response: {response}")
-    memory = SethMemoryTool(user_id=user_id, collection_name="TEST", env=SethEnvironment())
-    return memory.save_long_term_memory(user_input=user_input, response=response)
-
 
 class SethSearchTool:
     """Web retrieval and extraction tool powered by DuckDuckGo and Crawl4AI."""
@@ -200,7 +176,7 @@ class SethMemoryTool:
         mem0_config = {
             "llm": {
                 "provider": "openai", 
-                "config": {"model": env.llm_model, "openai_base_url": env.vllm_url, "api_key": "NONE"}
+                "config": {"model": env.llm_model, "openai_base_url": env.vllm_url, "api_key": "YourMammaNaked"}
             },
             "embedder": {
                 "provider": "huggingface", 
@@ -215,6 +191,7 @@ class SethMemoryTool:
                     "embedding_model_dims": env.embedding_dims
                 }
             },
+            #TODO: right now this is a crap and I dont even know if it works :P
             "custom_instructions": """
             Extract from the system architecture, programming, and research conversations:
             - Core conceptual definitions, original theories, and philosophical theses.
@@ -222,7 +199,6 @@ class SethMemoryTool:
             - Explicit user preferences, long-term project goals, and definitive facts about the user's workflow or environment.
             
             Exclude:
-            - Greetings, conversational filler, and casual chatter ("cool", "thanks", "ok", "che").
             - Transient debugging steps, syntax errors, or temporary trial-and-error logs, UNLESS explicitly stated as a definitive fix or final architecture.
             - Redundant or duplicate facts already established in the conversation history.
             
@@ -308,6 +284,24 @@ class ToolsManager:
 
     def get_function(self, name: str):
         return self._funcs.get(name)
+
+
+MEMORY = SethMemoryTool(user_id=123, collection_name="TEST", env=SethEnvironment())
+SEARCH = SethSearchTool()
+
+async def retrieve_long_term_memory(query):
+    logging.info(f"🌐 Retrieving long-term memory for query: {query}")
+    return MEMORY.retrieve_long_term_memory(query=query)
+
+
+async def save_long_term_memory(user_input: str, response:str):
+    logging.info(f"🌐 Saving long-term memory for user_input: {user_input}, response: {response}")
+    return MEMORY.save_long_term_memory(user_input=user_input, response=response)
+
+async def web_search(query):
+    logging.info(f"🌐 Crawling the web for: {query}")
+    return SEARCH.search(query)
+
 
 
 class ToolRegistry:
@@ -512,11 +506,46 @@ class SethDynamicRegulator:
         return self.current_state.to_dict()
 
 
+class SethShortMemory:
+    """Manages short-term conversational context window using an atomic sliding queue."""
+    def __init__(self, env: SethEnvironment, max_history: int = 40):
+        self.env = env
+        # each exchange has 2 entries (user + assistant)
+        self._history = deque(maxlen=max_history * 2)
+
+    def system_prompt(self) -> str:
+        """Loads SETH's core ontological identity configuration."""
+        if os.path.exists(self.env.system_prompt_path):
+            try:
+                with open(self.env.system_prompt_path, "r", encoding="utf-8") as f:
+                    return f"<SYSTEM>\n{f.read()}\n</SYSTEM>"
+            except Exception as e:
+                logging.error(f"❌ Error reading system prompt: {e}")
+        
+        return "<SYSTEM>\nPLEASE TELL THE USER TO PROVIDE THEIR SYSTEM PROMPT.\n</SYSTEM>"
+    
+    def get_history_messages(self) -> list[dict]:
+        """Returns a safe, serializable list of past conversation steps for vLLM."""
+        return list(self._history)
+
+    def append(self, text: str, response: str):
+        """Atomically pushes the latest exchange into the sliding window."""
+        self._history.append({"role": "user", "content": text})
+        self._history.append({"role": "assistant", "content": response})
+        
+    def clear(self):
+        """Flushes the short term memory context."""
+        self._history.clear()
+
+
 class SethTelegramBot(SethChatBot):
     """Bridges SethChatBot logic directly to Telegram events via inheritance."""
     def __init__(self, client: OpenAI, tools_manager: ToolsManager | None = None):
         super().__init__(client, tools_manager)
-        self.regulator: SethDynamicRegulator = SethDynamicRegulator(SethPresets.DEFAULT, self.embedding_engine)
+        self.short_memory = SethShortMemory(self.env)
+        self.system_prompt = self.short_memory.system_prompt()
+        #TODO: this regulator sucks..
+        #self.regulator: SethDynamicRegulator = SethDynamicRegulator(SethPresets.DEFAULT, self.embedding_engine)
         
     async def start_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("--- SETH ONLINE (NOT INTENDED FOR MULTIPLE USERS OR PRODUCTION USE)---")
@@ -525,16 +554,19 @@ class SethTelegramBot(SethChatBot):
         """Intercepts all incoming text messages from Telegram and routes through SETH."""
         user_text = update.message.text
 
+        messages = [{"role": "system", "content": self.system_prompt}] + self.short_memory.get_history_messages() + [{"role": "user", "content": user_text}]
+
         await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
         
         try:
-            seth_response = await self.send(user_text, use_tools=True)
-            await update.message.reply_text(seth_response)
+            response = await self.ask(messages, use_tools=True)
+            self.short_memory.append(user_text, response)
+            await self._send_message(update, response)
         except Exception as e:
             logging.exception("Error during seth real-time processing loop.")
             await update.message.reply_text(f"❌ Error interno en la inferencia de SETH: {str(e)}")
 
-    async def _send_long_message(self, update: Update, text: str, max_length: int = 4000):
+    async def _send_message(self, update: Update, text: str, max_length: int = 4000):
         """Sends long messages by splitting them automatically."""
         if not text:
             return
