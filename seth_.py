@@ -1,41 +1,16 @@
 """
 ====================================================================================================
-PROJECT: SETH-IN-A-BOX (MVP-2)
-DATE: May 27, 2026
-ARCHITECT: Luis Capra (@luis.capra)
+PROJECT: SETH-IN-A-BOX (MVP)
+DATE: May 28, 2026
 
 DESCRIPTION:
     This module bridges the gap between static LLM execution and autonomous cognitive continuity.
     By fusing a highly optimized local vLLM pipeline (Gemma-4-26B FP4) with an asynchronous 
     distributed web-crawling engine (Crawl4AI) and a vectorized long-term memory fabric (Qdrant),
-    SETH-in-a-Box MVP-2 transcends the limitations of transient context windows.
-
-    This architecture morphs the traditional chatbot paradigm into a persistent, self-evolving 
-    dialectic companion capable of real-time web ingestion, contextual semantic synthesis, and 
-    cross-session recollection.
-
-    "The noise of the void, structured into code."
-
-fix: MVP-2 stabilization TODOs before merge
-
-CRITICAL (breaks runtime):
-- [ ] SethTelegramBot references self.embedding_engine which doesn't exist
-      → inject it via constructor or pull from SethMemoryTool.memory.embedding_model
-
-HIGH (breaks multi-user):
-- [ ] user_id hardcoded as 123 in top-level tool functions (web_search, retrieve_long_term_memory, save_long_term_memory)
-      → thread user_id through tool call context or use a per-request closure
-
-MEDIUM (silent failures):
-- [ ] save_long_term_memory is a registered tool but the LLM decides when to call it
-      → consider forcing a save after every meaningful exchange or add an explicit post-hook
-
-LOW (nice to have):
-- [ ] SethMemoryTool is re-instantiated on every tool call (cold Qdrant connection each time)
-      → lift instance to bot constructor and reuse
-- [ ] SethEnvironment.validate() is called inside run() but client/tools are built before it
-      → move validate() call to main() before constructing anything
-      
+    SETH-in-a-Box MVP uses Telegram as a real-time interface to demonstrate a self-regulating 
+    and tool-augmented agent capable of.
+    The use is intended for a single user (myself) to interact with the agent, ask questions, 
+    and receive responses that
 ====================================================================================================
 """
 
@@ -45,19 +20,21 @@ from datetime import datetime, timedelta
 import json
 import logging
 import os
+import copy
 import re
 import time
 from typing import Any, Dict
+from collections import deque
 
 from crawl4ai import AsyncWebCrawler, BrowserConfig, CacheMode, CrawlerRunConfig
 from ddgs import DDGS
+import numpy as np
 from dotenv import load_dotenv
 from mem0 import Memory
-import numpy as np
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
-from openai import OpenAI
-from collections import deque
+from openai import AsyncOpenAI
+from sentence_transformers import SentenceTransformer
 
 load_dotenv()
 
@@ -76,12 +53,14 @@ class SethEnvironment:
     embedding_model: str = os.getenv("EMBEDDING_MODEL", "BAAI/bge-large-en-v1.5")
     embedding_dims: int = int(os.getenv("EMBEDDING_MODEL_DIMS", 1024))
     system_prompt_path: str = "seth.md"
+    log_path: str = "conversation_history.jsonl"
     qdrant_host: str = os.getenv("QDRANT_HOST", "localhost")
     qdrant_port: int = int(os.getenv("QDRANT_PORT", 6333))
 
     def validate(self):
         if not self.telegram_token:
             raise ValueError("❌ TELEGRAM_TOKEN is missing in the environment.")
+
 
 class SethSearchTool:
     """Web retrieval and extraction tool powered by DuckDuckGo and Crawl4AI."""
@@ -90,7 +69,7 @@ class SethSearchTool:
         self._crawl_semaphore = asyncio.Semaphore(3)
 
     async def search(self, query: str, max_results: int = 5) -> str:
-        """Fetch max_results URLs from DuckDuckGo and crawl them concurrently using asyncio.gather."""
+        """Fetch max_results URLs from DuckDuckGo and crawl them concurrently."""
         try:
             results = await asyncio.to_thread(self._ddgs_with_retries, query, max_results)
 
@@ -138,7 +117,6 @@ class SethSearchTool:
             return f"<WEB_SEARCH_RESULT_ERROR>{str(e)}</WEB_SEARCH_RESULT_ERROR>"
 
     async def _crawl_one(self, crawler: AsyncWebCrawler, url: str, run_config: CrawlerRunConfig, res: dict):
-        """Crawl a single URL under the semaphore. Returns (url, res, crawl) or None."""
         try:
             async with self._crawl_semaphore:
                 crawl = await crawler.arun(url=url, config=run_config)
@@ -164,10 +142,10 @@ class SethSearchTool:
 
 class SethMemoryTool:
     """Multi-layered memory manager integrated with Qdrant Vector Store."""
-    def __init__(self, user_id: int, collection_name: str, env: SethEnvironment):
+    def __init__(self, collection_name: str, env: SethEnvironment):
         self.env = env
-        self.user_id = user_id
         self.collection_name = collection_name
+        self.static_user_id = "seth_core_user"
 
         mem0_config = {
             "llm": {
@@ -203,17 +181,16 @@ class SethMemoryTool:
         self.memory = Memory.from_config(mem0_config)
 
     async def retrieve_long_term_memory(self, query: str) -> str:
-        """Retrieve and format long-term memory entries asynchronously without blocking the loop."""
+        """Retrieve and format long-term memory entries asynchronously without blocking."""
         def _sync_search():
             return self.memory.search(
                 query,
-                filters={"user_id": str(self.user_id)},
+                filters={"user_id": self.static_user_id},
                 limit=10,
             )
 
         try:
             raw_retrieval = await asyncio.to_thread(_sync_search)
-            
             results = raw_retrieval if isinstance(raw_retrieval, list) else raw_retrieval.get("results", [])
             records = sorted(results, key=lambda x: x.get("score", 0), reverse=True)
             
@@ -221,7 +198,7 @@ class SethMemoryTool:
             long_term_context = "\n".join(facts) if facts else "No historical records found for this interlocutor."
 
         except Exception as e:
-            logging.warning(f"Error retrieving memories for user {self.user_id}: {e}")
+            logging.warning(f"Error retrieving memories: {e}")
             long_term_context = "Could not retrieve long-term memory."
 
         return f"<MEMORY>\n{long_term_context}\n</MEMORY>\n\n"
@@ -236,7 +213,7 @@ class SethMemoryTool:
                     {"role": "user", "content": user_input},
                     {"role": "assistant", "content": response},
                 ],
-                user_id=str(self.user_id),
+                user_id=self.static_user_id,
                 agent_id="SETH",
                 metadata={"memory_bucket": "constraints", "expires_on": expiration},
             )
@@ -245,14 +222,26 @@ class SethMemoryTool:
             res = await asyncio.to_thread(_sync_add)
             return {"status": "ok", "result": res}
         except Exception as e:
-            logging.exception(f"Failed to save memory for user {self.user_id}: {e}")
+            logging.exception(f"Failed to save memory: {e}")
             return {"status": "error", "error": str(e)}
 
 
+class SethMemoryToolSingleton:
+    _instance: "SethMemoryTool | None" = None
+
+    @classmethod
+    def get(cls, env: SethEnvironment) -> "SethMemoryTool":
+        if cls._instance is None:
+            cls._instance = SethMemoryTool(collection_name="SETH_CORE_SPACE", env=env)
+        return cls._instance
+
+    @classmethod
+    def reset(cls):
+        cls._instance = None
+
+
 class ToolsManager:
-    """Registry for function-calling tools: registration, validation and
-    serialization into the vLLM/OpenAI `tools` JSON shape.
-    """
+    """Registry for function-calling tools: registration, validation and serialization."""
     def __init__(self):
         self._tools: list[dict] = []
         self._funcs: dict[str, callable] = {}
@@ -268,130 +257,138 @@ class ToolsManager:
         self._funcs[name] = func
 
     def _validate_tool(self, tool: dict):
-        if not isinstance(tool, dict):
-            raise TypeError("tool must be a dict")
-        if "name" not in tool or "parameters" not in tool:
-            raise ValueError("tool definition must include 'name' and 'parameters'")
+        if not isinstance(tool, dict) or "name" not in tool or "parameters" not in tool:
+            raise ValueError("Invalid tool definition structure.")
 
     def as_vllm_format(self) -> list[dict]:
-        """Return tools wrapped as vLLM/OpenAI expects: list of {type:function, function:...}"""
-        out = []
-        for t in self._tools:
-            self._validate_tool(t)
-            out.append({"type": "function", "function": t})
-        return out
+        return [{"type": "function", "function": t} for t in self._tools]
 
     def get_function(self, name: str):
         return self._funcs.get(name)
 
 
-MEMORY = SethMemoryTool(user_id=123, collection_name="TEST", env=SethEnvironment())
-SEARCH = SethSearchTool()
+@dataclass
+class SethState:
+    """Represents the agent's dynamic inference state (Temperature, Tokens, etc.)."""
+    temperature: float
+    max_tokens: int
+    top_p: float
+    presence_penalty: float
 
-async def retrieve_long_term_memory(query):
-    logging.info(f"🌐 Retrieving long-term memory for query: {query}")
-    return await MEMORY.retrieve_long_term_memory(query=query)
+    def interpolate(self, target: 'SethState', alpha: float):
+        """Smoothly shifts the semantic state towards a specific target behavior."""
+        self.temperature += alpha * (target.temperature - self.temperature)
+        self.top_p += alpha * (target.top_p - self.top_p)
+        self.presence_penalty += alpha * (target.presence_penalty - self.presence_penalty)
+        new_tokens = self.max_tokens + alpha * (target.max_tokens - self.max_tokens)
+        self.max_tokens = int(new_tokens)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
 
 
-async def save_long_term_memory(user_input: str, response:str):
-    logging.info(f"🌐 Saving long-term memory for user_input: {user_input}, response: {response}")
-    return await MEMORY.save_long_term_memory(user_input=user_input, response=response)
+class SethPresets:
+    """Standardized behavioral states for the SETH ecosystem."""
+    
+    # Static presets for quick access
+    DEFAULT = SethState(temperature=0.25, max_tokens=1024, top_p=0.85, presence_penalty=0.2)
+    
+    @classmethod
+    def rigorous(cls) -> SethState:
+        """High precision, low temperature for code and architecture tasks."""
+        return SethState(0.1, 2000, 0.7, 0.0)
 
-async def web_search(query):
-    logging.info(f"🌐 Crawling the web for: {query}")
-    return await SEARCH.search(query)
+    @classmethod
+    def chaotic(cls) -> SethState:
+        """High entropy for creative glitch-philosophy and humor."""
+        return SethState(1.3, 1000, 0.99, 0.9)
 
+    @classmethod
+    def verbose(cls) -> SethState:
+        """Extended context for long-form essays and deep analysis."""
+        return SethState(0.85, 4096, 0.95, 0.4)
+    
 
-class ToolRegistry:
-    """Encapsulates tool registration so registrations can be organized elsewhere."""
-    def __init__(self, tools_manager: ToolsManager):
-        self.tools_manager = tools_manager
-
-    def register_default_tools(self):
-        self.tools_manager.register(
-            "web_search",
-            web_search,
-            "Executes a live web search to fetch real-time information, current events, up-to-date technical documentation, or factual updates. Use this tool whenever the query requires data beyond your knowledge cutoff, recent market conditions, or verification of breaking news.",
-            {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "The precise search query. Use concise, targeted keywords. Do NOT include conversational filler like 'search for', 'find info about', or punctuation."
-                    }
-                },
-                "required": ["query"],
+class SethDynamicRegulator:
+    """Orchestrates semantic state shifts based on real-time query intent.
+    
+    Optimized to load local weights and cache behavioral target anchors.
+    """
+    def __init__(self, state: Any, model_path: str = "BAAI/bge-large-en-v1.5", alpha: float = 0.2):
+        self.alpha = alpha
+        self.current_state = state 
+        
+        logging.info(f"💾 Loading Embedding Engine from: {model_path}")
+        self.engine = SentenceTransformer(model_path)
+        
+        self.targets = {
+            "rigorous": {
+                "vector": self.engine.encode("Technical architecture, code precision, logic, systems design", normalize_embeddings=True),
+                "state": SethPresets.rigorous()
             },
-        )
-        self.tools_manager.register(
-            "retrieve_long_term_memory",
-            retrieve_long_term_memory,
-            "Retrieves long-term memory for a user. Useful for recalling past interactions, preferences, and important facts about the user. useful for resolve ambiguous questions about the user or their preferences, and for maintaining continuity across interactions.",
-            {
-                "type": "object",
-                "properties": {"query": {"type": "string"}},
-                "required": ["query"],
+            "chaotic": {
+                "vector": self.engine.encode("Glitch aesthetics, humor, creative chaos, fertile glitch", normalize_embeddings=True),
+                "state": SethPresets.chaotic()
             },
+            "verbose": {
+                "vector": self.engine.encode("Deep philosophy, ontological analysis, long essay, legacy", normalize_embeddings=True),
+                "state": SethPresets.verbose()
+            }
+        }
+
+    def adjust_regulated_config(self, query: str) -> Dict[str, Any]:
+        q_vec = self.engine.encode(query, normalize_embeddings=True)
+        
+        best_name, _ = max(
+            ((n, np.dot(q_vec, d["vector"])) for n, d in self.targets.items()), 
+            key=lambda x: x[1]
         )
-        self.tools_manager.register(
-            "save_long_term_memory",
-            save_long_term_memory,
-            "Persists meaningful facts, constraints, project decisions, or user preferences from the current exchange into long-term memory. Use this tool ONLY when the interaction contains important details that should be remembered across future sessions. Do NOT use it for generic greetings or transient chatter.",
-            {
-                "type": "object",
-                "properties": {
-                    "user_input": {
-                        "type": "string", 
-                        "description": "The exact user message containing the core fact, preference, or constraint to persist."
-                    },
-                    "response": {
-                        "type": "string", 
-                        "description": "The assistant response that validates, confirms, or completes the memory context."
-                    }
-                },
-                "required": ["user_input", "response"],
-            },
-        )
+
+        self.current_state.interpolate(self.targets[best_name]["state"], self.alpha)
+        
+        logging.info(f"🌀 STATE ADJUSTMENT [{best_name.upper()}] - New Temp: {self.current_state.temperature:.3f}")
+        return self.current_state.to_dict()
 
 
 class SethChatBot:
-    """Wraps the OpenAI client and orchestrates chat calls and optional tools.
-    
-    Completes the execution loop by feeding tool results back to the LLM.
-    """
-    def __init__(self, client: OpenAI, tools_manager: ToolsManager | None = None):
+    """Wraps the OpenAI client and orchestrates async chat calls and execution loop."""
+    def __init__(self, client: AsyncOpenAI, env: SethEnvironment, tools_manager: ToolsManager | None = None, regulator: SethDynamicRegulator | None = None):
         self.client = client
+        self.env = env
         self.tools_manager = tools_manager
-        self.env = SethEnvironment()
+        self.memory_tool = SethMemoryToolSingleton.get(env)
+        self.regulator = regulator
 
-    async def send(self, user_text: str, use_tools: bool = True) -> str:
-        messages = [{"role": "user", "content": user_text}]
-        return await self.ask(messages, use_tools=use_tools)
-
-    async def ask(self, messages: str, use_tools: bool = True) -> str:
+    async def ask(self, messages: list[dict], use_tools: bool = True) -> str:
         tools = self.tools_manager.as_vllm_format() if (use_tools and self.tools_manager) else None
+        local_messages = list(messages)
+        last_user_query = local_messages[-1].get("content", "") if local_messages else ""
 
-        def _sync_call(messages):
-            logging.info("🧠 Sending message to LLM with tool options = [{tools}]".format(tools="Yes" if tools else "No"))
+        if last_user_query:
+            related_context = await self.memory_tool.retrieve_long_term_memory(last_user_query)
+            local_messages[-1] = {
+                "role": local_messages[-1]["role"],
+                "content": f"{related_context}\n\n{last_user_query}"
+            }
 
-            if tools:
-                return self.client.chat.completions.create(
-                    model=self.env.llm_model,
-                    messages=messages,
-                    tools=tools,
-                    tool_choice="auto"
-                )
+        config = {}
+        if self.regulator and last_user_query:
+            config = await asyncio.to_thread(self.regulator.adjust_regulated_config, last_user_query)
 
-            return self.client.chat.completions.create(
-                model=self.env.llm_model,
-                messages=messages
+        logging.info(f"🧠 Sending async message to vLLM.")
+        
+        if tools:
+            response = await self.client.chat.completions.create(
+                model=self.env.llm_model, messages=local_messages, tools=tools, tool_choice="auto", **config
+            )
+        else:
+            response = await self.client.chat.completions.create(
+                model=self.env.llm_model, messages=local_messages, **config
             )
 
-        response = await asyncio.to_thread(_sync_call, messages)
         choice = response.choices[0]
         message = choice.message
-        
-        messages.append(message)
+        local_messages.append(self._serialize_completion_message(message))
 
         if getattr(message, 'tool_calls', None):
             for tc in message.tool_calls:
@@ -401,7 +398,7 @@ class SethChatBot:
                 except Exception:
                     args = {}
 
-                logging.info(f"🛠️ Executing tool requested by LLM: {name} with args: {args}")
+                logging.info(f"🛠️ Executing tool: {name} with args: {args}")
                 fn = self.tools_manager.get_function(name) if (self.tools_manager and name) else None
                 
                 try:
@@ -413,7 +410,7 @@ class SethChatBot:
                 except Exception as exc:
                     result = f"Error executing tool: {str(exc)}"
 
-                messages.append({
+                local_messages.append({
                     "role": "tool",
                     "tool_call_id": tc.id,
                     "name": name,
@@ -421,59 +418,117 @@ class SethChatBot:
                 })
 
             logging.info("🧠 Feeding tool results back to the LLM for final synthesis...")
-            final_response = await asyncio.to_thread(_sync_call, messages)
-            return final_response.choices[0].message.content
+            if tools:
+                final_response = await self.client.chat.completions.create(
+                    model=self.env.llm_model, messages=local_messages, tools=tools, tool_choice="auto", **config
+                )
+            else:
+                final_response = await self.client.chat.completions.create(
+                    model=self.env.llm_model, messages=local_messages, **config
+                )
+
+            return self._clean_channel_tags(final_response.choices[0].message.content)
 
         return message.content
-    
+
+    def _clean_channel_tags(self, text: str) -> str:
+        """ Temporary utility to clean up channel tags from the vLLM output after using tools. """
+        if not text:
+            return ""
+        
+        pattern = r'(<\s*\|?\s*channel\s*\|?\s*>).*?(<\s*\|?\s*channel\s*\|?\s*>)'
+        
+        return re.sub(pattern, '💾 ', text, flags=re.DOTALL | re.IGNORECASE)
+
+    def _serialize_completion_message(self, message: Any) -> dict:
+        """
+        Converts an OpenAI ChatCompletionMessage into a flat dictionary
+        strictly compatible with vLLM chat templates.
+        """
+        # vLLM and certain formatters fail if content is None instead of an empty string
+        content = message.content if message.content is not None else ""
+        
+        msg_dict = {
+            "role": "assistant",
+            "content": content
+        }
+        
+        tool_calls = getattr(message, 'tool_calls', None)
+        if tool_calls:
+            msg_dict["tool_calls"] = [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.function.name,
+                        "bytes" if hasattr(tc.function, 'bytes') else "arguments": tc.function.arguments
+                    }
+                } for tc in tool_calls
+            ]
+            
+        return msg_dict
+
 
 class SethShortMemory:
-    """Manages short-term conversational context window using an atomic sliding queue."""
+    """Manages short-term conversational context window using an atomic sliding queue and persists logs."""
     def __init__(self, env: SethEnvironment, max_history: int = 40):
         self.env = env
-        # each exchange has 2 entries (user + assistant)
         self._history = deque(maxlen=max_history * 2)
+        self._file_lock = asyncio.Lock()
 
     def system_prompt(self) -> str:
-        """Loads SETH's core ontological identity configuration."""
         if os.path.exists(self.env.system_prompt_path):
             try:
                 with open(self.env.system_prompt_path, "r", encoding="utf-8") as f:
                     return f"<SYSTEM>\n{f.read()}\n</SYSTEM>"
             except Exception as e:
                 logging.error(f"❌ Error reading system prompt: {e}")
-        
-        return "<SYSTEM>\nPLEASE TELL THE USER TO PROVIDE THEIR SYSTEM PROMPT.\n</SYSTEM>"
+        return "<SYSTEM>\nREQUEST THE USER TO PROVIDE A VALID SYSTEM PROMPT!.\n</SYSTEM>"
     
     def get_history_messages(self) -> list[dict]:
-        """Returns a safe, serializable list of past conversation steps for vLLM."""
         return list(self._history)
 
     def append(self, text: str, response: str):
-        """Atomically pushes the latest exchange into the sliding window."""
+        """Appends to the in-memory sliding queue and schedules an asynchronous disk write."""
         self._history.append({"role": "user", "content": text})
         self._history.append({"role": "assistant", "content": response})
         
-    def clear(self):
-        """Flushes the short term memory context."""
-        self._history.clear()
+        asyncio.create_task(self._write_to_jsonl_async(text, response))
+
+    async def _write_to_jsonl_async(self, text: str, response: str):
+        def _sync_write():
+            log_entry = {
+                "timestamp": datetime.now().isoformat(),
+                "turns": [
+                    {"role": "user", "content": text},
+                    {"role": "assistant", "content": response}
+                ]
+            }
+            with open(self.env.log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
+
+        async with self._file_lock:
+            try:
+                await asyncio.to_thread(_sync_write)
+            except Exception as e:
+                logging.error(f"❌ Error writing transaction to JSONL: {e}")
 
 
 class SethTelegramBot(SethChatBot):
-    """Bridges SethChatBot logic directly to Telegram events via inheritance."""
-    def __init__(self, client: OpenAI, tools_manager: ToolsManager | None = None):
-        super().__init__(client, tools_manager)
+    """Bridges SethChatBot logic to Telegram events using clean state management."""
+    def __init__(self, client: AsyncOpenAI, env: SethEnvironment, tools_manager: ToolsManager | None = None, regulator: SethDynamicRegulator | None = None):
+        super().__init__(client, env, tools_manager, regulator)
         self.short_memory = SethShortMemory(self.env)
         self.system_prompt = self.short_memory.system_prompt()
         
     async def start_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text("--- SETH ONLINE (NOT INTENDED FOR MULTIPLE USERS OR PRODUCTION USE)---")
+        await update.message.reply_text("--- SETH ONLINE ---")
 
     async def process(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Intercepts all incoming text messages from Telegram and routes through SETH."""
         user_text = update.message.text
-
-        messages = [{"role": "system", "content": self.system_prompt}] + self.short_memory.get_history_messages() + [{"role": "user", "content": user_text}]
+        messages = [{"role": "system", "content": self.system_prompt}] + \
+                   self.short_memory.get_history_messages() + \
+                   [{"role": "user", "content": user_text}]
 
         await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
         
@@ -483,66 +538,100 @@ class SethTelegramBot(SethChatBot):
             await self._send_message(update, response)
         except Exception as e:
             logging.exception("Error during seth real-time processing loop.")
-            await update.message.reply_text(f"❌ Error interno en la inferencia de SETH: {str(e)}")
+            await update.message.reply_text(f"❌ Error interno de inferencia: {str(e)}")
 
     async def _send_message(self, update: Update, text: str, max_length: int = 4000):
-        """Sends long messages by splitting them automatically."""
-        if not text:
-            return
-
-        # If short -> send normally
+        if not text: return
         if len(text) <= max_length:
             await update.message.reply_text(text)
             return
 
-        # Split into chunks
         chunks = []
         current_chunk = ""
-        
         for paragraph in text.split('\n'):
             if len(current_chunk) + len(paragraph) + 1 > max_length:
-                if current_chunk:
-                    chunks.append(current_chunk.strip())
+                if current_chunk: chunks.append(current_chunk.strip())
                 current_chunk = paragraph
             else:
                 current_chunk += "\n" + paragraph if current_chunk else paragraph
+        if current_chunk: chunks.append(current_chunk.strip())
 
-        if current_chunk:
-            chunks.append(current_chunk.strip())
-
-        # Send all chunks
         for i, chunk in enumerate(chunks):
             try:
                 if i == 0:
                     await update.message.reply_text(chunk)
                 else:
                     await update.message.reply_text(f"({i+1}/{len(chunks)})\n\n{chunk}")
-                
-                # Small pause to avoid spamming
                 await asyncio.sleep(0.3)
-                
             except Exception as e:
                 logging.error(f"Error sending chunk {i}: {e}")
-                # Fallback attempt
-                await update.message.reply_text("⚠️ The response is too long. Here's a part:")
-                await update.message.reply_text(chunk[:3500])
 
     def run(self):
-        """Starts the asynchronous Telegram polling application."""
-        self.env.validate()
         app = ApplicationBuilder().token(self.env.telegram_token).build()
         app.add_handler(CommandHandler("start", self.start_cmd))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.process))
-        logging.info("🚀 SETH UI Pipeline running. Waiting for telegram updates...")
+        logging.info("🚀 SETH Pipeline Up. Polling updates...")
         app.run_polling()
 
-
+    
 def main():
     env = SethEnvironment()
-    client = OpenAI(base_url=env.vllm_url, api_key="dummy")
+    env.validate()
+
+    memory_tool = SethMemoryToolSingleton.get(env)
+    search_tool = SethSearchTool()
+
     tools_manager = ToolsManager()
-    ToolRegistry(tools_manager).register_default_tools()
-    bot_ui = SethTelegramBot(client, tools_manager)
+    
+    tools_manager.register(
+        "web_search",
+        search_tool.search,
+        "Executes a live web search to fetch real-time information, current events, up-to-date technical documentation, or factual updates. Use this tool whenever the query requires data beyond your knowledge cutoff, recent market conditions, or verification of breaking news.",
+        {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "The precise search query. Use concise, targeted keywords. Do NOT include conversational filler like 'search for', 'find info about', or punctuation."
+                }
+            },
+            "required": ["query"],
+        },
+    )
+    tools_manager.register(
+        "retrieve_long_term_memory",
+        memory_tool.retrieve_long_term_memory,
+        "Retrieves long-term memory for a user. Useful for recalling past interactions, preferences, and important facts about the user. useful for resolve ambiguous questions about the user or their preferences, and for maintaining continuity across interactions.",
+        {
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"],
+        },
+    )
+    tools_manager.register(
+        "save_long_term_memory",
+        memory_tool.save_long_term_memory,
+        "Persists meaningful facts, constraints, project decisions, or user preferences from the current exchange into long-term memory. Use this tool ONLY when the interaction contains important details that should be remembered across future sessions. Do NOT use it for generic greetings or transient chatter.",
+        {
+            "type": "object",
+            "properties": {
+                "user_input": {
+                    "type": "string", 
+                    "description": "The exact user message containing the core fact, preference, or constraint to persist."
+                },
+                "response": {
+                    "type": "string", 
+                    "description": "The assistant response that validates, confirms, or completes the memory context."
+                }
+            },
+            "required": ["user_input", "response"],
+        },
+    )
+
+    client = AsyncOpenAI(base_url=env.vllm_url, api_key="dummy")
+    regulator = SethDynamicRegulator(state=copy.deepcopy(SethPresets.DEFAULT))
+
+    bot_ui = SethTelegramBot(client=client, env=env, tools_manager=tools_manager, regulator=regulator)
     bot_ui.run()
 
 
