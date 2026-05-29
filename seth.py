@@ -8,6 +8,7 @@ from collections import deque
 from typing import Dict, List, Any, Optional
 from dataclasses import dataclass, asdict
 from dotenv import load_dotenv
+import asyncio
 
 import openai
 from mem0 import Memory
@@ -189,23 +190,75 @@ class SethMemory:
         self.eternal_memory = Memory.from_config(mem0_config)
         self.bge_engine = self.eternal_memory.embedding_model.model
 
+    def _normalize_mem0_results(self, raw_retrieval: Any) -> List[Dict]:
+        """Normaliza el resultado de mem0.search() independientemente de la versión."""
+        if raw_retrieval is None:
+            return []
+        
+        # Caso 1: Ya es una lista (comportamiento v1.0)
+        if isinstance(raw_retrieval, list):
+            return raw_retrieval
+        
+        # Caso 2: Es un diccionario con "results" (comportamiento v1.1 + Platform)
+        if isinstance(raw_retrieval, dict):
+            # Prioridad al key "results"
+            if "results" in raw_retrieval:
+                results = raw_retrieval["results"]
+                return results if isinstance(results, list) else []
+            
+            # Fallback: a veces devuelve directamente los items
+            return [raw_retrieval] if any(k in raw_retrieval for k in ("memory", "id")) else []
+        
+        # Caso raro: objeto con atributo results (por si acaso)
+        if hasattr(raw_retrieval, "results"):
+            results = raw_retrieval.results
+            return results if isinstance(results, list) else []
+        
+        return []
+
     def get_full_context(self, user_id: int, name: str, query: str) -> str:
         """Retrieves and compiles context from Soul Ontology and Eternal Memory."""
-        # 1. Load Soul (Identity Definition)
+        # 1. Soul Ontology
         soul_ontology = ""
         if os.path.exists(self.env.soul_path):
             with open(self.env.soul_path, "r", encoding="utf-8") as f:
                 soul_ontology = f"<SOUL_ONTOLOGY>\n{f.read()}\n</SOUL_ONTOLOGY>"
-        
-        # 2. Retrieve Eternal Memory from Qdrant
-        raw_retrieval = self.eternal_memory.search(query, filters={"user_id": str(user_id)})
-        
-        # Normalize search results
-        memory_records = raw_retrieval.get("results", []) if isinstance(raw_retrieval, dict) else raw_retrieval
-        facts = [f"- {r.get('memory', r.memory if hasattr(r, 'memory') else '')}" for r in memory_records]
-        
-        long_term_context = "\n".join(facts) if facts else "No historical records found for this interlocutor."
-        
+
+        # 2. Eternal Memory (mejor normalizado)
+        try:
+            raw_retrieval = self.eternal_memory.search(
+                query, 
+                filters={"user_id": str(user_id)}, 
+                limit=10
+            )
+            
+            memory_records = self._normalize_mem0_results(raw_retrieval)
+            
+            # RANK - we should improve this..
+            if isinstance(memory_records, list) and memory_records:
+                memory_records = sorted(
+                    memory_records, 
+                    key=lambda x: x.get('score', 0) if isinstance(x, dict) else 0,
+                    reverse=True
+                )
+            
+            facts = []
+            for r in memory_records:
+                if isinstance(r, dict):
+                    memory_text = r.get('memory') or r.get('content') or str(r)
+                else:
+                    memory_text = str(r)
+                
+                if memory_text.strip():
+                    facts.append(f"- {memory_text.strip()}")
+                    
+        except Exception as e:
+            logging.warning(f"Error retrieving memories for user {user_id}: {e}")
+            facts = []
+            long_term_context = "No se pudo recuperar memoria a largo plazo."
+        else:
+            long_term_context = "\n".join(facts) if facts else "No historical records found for this interlocutor."
+
         return (
             f"{soul_ontology}\n\n"
             f"<LONG_TERM_MEMORY>\n{long_term_context}\n</LONG_TERM_MEMORY>\n\n"
@@ -336,9 +389,51 @@ class SethTelegramBot:
         # Persistent Memory Update
         history.append({"role": "user", "content": text})
         history.append({"role": "assistant", "content": response})
-        self.memory.eternal_memory.add(f"{u_name}: {text}. SETH: {response}", user_id=str(u_id))
+        self.memory.eternal_memory.add(f"{u_name}: {text}. SETH: {response}", user_id=str(u_id), infer=False)
         
-        await update.message.reply_text(response)
+        await self._send_long_message(update, response)
+
+    async def _send_long_message(self, update: Update, text: str, max_length: int = 4000):
+        """Envía mensajes largos dividiéndolos automáticamente."""
+        if not text:
+            return
+
+        # Si es corto → envío normal
+        if len(text) <= max_length:
+            await update.message.reply_text(text)
+            return
+
+        # Dividir en chunks
+        chunks = []
+        current_chunk = ""
+        
+        for paragraph in text.split('\n'):
+            if len(current_chunk) + len(paragraph) + 1 > max_length:
+                if current_chunk:
+                    chunks.append(current_chunk.strip())
+                current_chunk = paragraph
+            else:
+                current_chunk += "\n" + paragraph if current_chunk else paragraph
+
+        if current_chunk:
+            chunks.append(current_chunk.strip())
+
+        # Enviar todos los chunks
+        for i, chunk in enumerate(chunks):
+            try:
+                if i == 0:
+                    await update.message.reply_text(chunk)
+                else:
+                    await update.message.reply_text(f"({i+1}/{len(chunks)})\n\n{chunk}")
+                
+                # Pequeña pausa para no spamear
+                await asyncio.sleep(0.3)
+                
+            except Exception as e:
+                logging.error(f"Error sending chunk {i}: {e}")
+                # Intento fallback
+                await update.message.reply_text("⚠️ La respuesta es muy larga. Aquí va una parte:")
+                await update.message.reply_text(chunk[:3500])
 
     def run(self):
         self.app.run_polling()

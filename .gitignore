@@ -1,3 +1,4 @@
 .env
 __pycache__/
 .vscode/
+conversation_history.jsonl
