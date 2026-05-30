@@ -132,22 +132,10 @@ class SethSearchTool:
 
 
 class Mem0MemoryBuilder:
-    #TODO: this will encapsulate mem0, to use in SethMemoryTool and reuse the embedder for the class SethDynamicRegulator, 
-    #to avoid loading the same embedding model twice and to have a single source of truth for memory management and embedding 
-    # generation in the SETH ecosystem. It will also allow us to implement more complex memory management strategies, such as 
-    # different memory buckets, expiration policies, and more sophisticated retrieval prompts, while keeping the integration 
-    # with mem0 clean and modular.
-    pass
-
-
-class SethMemoryTool:
-    """Multi-layered memory manager integrated with Qdrant Vector Store."""
     def __init__(self, collection_name: str, env: SethEnvironment):
         self.env = env
         self.collection_name = collection_name
-        self.static_user_id = "seth_core_user"
-
-        mem0_config = {
+        self.mem0_config = {
             "llm": {
                 "provider": "openai", 
                 "config": {"model": env.llm_model, "openai_base_url": env.vllm_url, "api_key": "dummy_key"}
@@ -165,33 +153,39 @@ class SethMemoryTool:
                     "embedding_model_dims": env.embedding_dims
                 }
             },
-            "custom_instructions": """
-            Extract from the system architecture, programming, and research conversations:
-            - Core conceptual definitions, original theories, and philosophical theses.
-            - High-level software engineering patterns, system design decisions, hardware configurations, and infrastructure specs.
-            - Explicit user preferences, long-term project goals, and definitive facts about the user's workflow or environment.
-            
-            Exclude:
-            - Transient debugging steps, syntax errors, or temporary trial-and-error logs, UNLESS explicitly stated as a definitive fix or final architecture.
-            - Redundant or duplicate facts already established in the conversation history.
-            
-            Return JSON with key "facts" as a list of strings (use [] if nothing to store).
-            """
         }
-        # Defer heavy Memory initialization until first use to avoid blocking startup.
-        self._mem_config = mem0_config
         self._memory = None
 
-    def _init_memory(self):
-        """Synchronous initializer for the Memory instance (safe to call inside threads)."""
+    def build(self) -> Memory:
         if self._memory is None:
-            self._memory = Memory.from_config(self._mem_config)
+            self._memory = Memory.from_config(self.mem0_config)
         return self._memory
+        
+
+class Mem0MemorySingleton:
+    _instance: "Memory | None" = None
+
+    @classmethod
+    def get(cls, env: SethEnvironment) -> "Memory":
+        if cls._instance is None:
+            cls._instance = Mem0MemoryBuilder(collection_name="SETH_CORE_SPACE", env=env).build()
+        return cls._instance
+
+    @classmethod
+    def reset(cls):
+        cls._instance = None
+
+
+class SethMemoryTool:
+    """Multi-layered memory manager integrated with Qdrant Vector Store."""
+    def __init__(self, env: SethEnvironment):
+        self.env = env
+        self.static_user_id = "seth_core_user"
 
     async def retrieve_long_term_memory(self, query: str) -> str:
         """Retrieve and format long-term memory entries asynchronously without blocking."""
         def _sync_search():
-            mem = self._init_memory()
+            mem = Mem0MemorySingleton.get(self.env)
             return mem.search(
                 query,
                 filters={"user_id": self.static_user_id},
@@ -214,7 +208,7 @@ class SethMemoryTool:
 
     async def retrieve_very_long_term_memory(self, query: str) -> str:
         def _sync_deep_search():
-            mem = self._init_memory()
+            mem = Mem0MemorySingleton.get(self.env)
             return mem.search(
                 query,
                 filters={"user_id": self.static_user_id},
@@ -240,7 +234,7 @@ class SethMemoryTool:
         expiration = (datetime.now() + timedelta(days=14)).strftime("%Y-%m-%d")
 
         def _sync_add():
-            mem = self._init_memory()
+            mem = Mem0MemorySingleton.get(self.env)
             return mem.add(
                 [
                     {"role": "user", "content": user_input},
@@ -257,20 +251,6 @@ class SethMemoryTool:
         except Exception as e:
             logging.exception(f"Failed to save memory: {e}")
             return {"status": "error", "error": str(e)}
-
-
-class SethMemoryToolSingleton:
-    _instance: "SethMemoryTool | None" = None
-
-    @classmethod
-    def get(cls, env: SethEnvironment) -> "SethMemoryTool":
-        if cls._instance is None:
-            cls._instance = SethMemoryTool(collection_name="SETH_CORE_SPACE", env=env)
-        return cls._instance
-
-    @classmethod
-    def reset(cls):
-        cls._instance = None
 
 
 class SethSelfInspectorTool:
@@ -431,9 +411,13 @@ class SethDynamicRegulator:
         self.alpha = alpha
         self.current_state = state 
         
-        logging.info(f"💾 Loading Embedding Engine from: {self.env.embedding_model}")
-        self.engine = SentenceTransformer(self.env.embedding_model)
-        
+        #HACK: to avoid the use SentenceTransformer
+        try:
+            self.engine = Mem0MemorySingleton.get(self.env).embedding_model.model
+        except Exception as e:
+            logging.error(f"Failed to load embedding model from Memory singleton: {e}")
+            self.engine = SentenceTransformer(self.env.embedding_model)
+
         self.targets = {
             "rigorous": {
                 "vector": self.engine.encode("Technical architecture, code precision, logic, systems design", convert_to_tensor=True, normalize_embeddings=True),
@@ -465,11 +449,11 @@ class SethDynamicRegulator:
 
 class SethChatBot:
     """Wraps the OpenAI client and orchestrates async chat calls and execution loop."""
-    def __init__(self, client: AsyncOpenAI, env: SethEnvironment, tools_manager: ToolsManager | None = None, regulator: SethDynamicRegulator | None = None):
+    def __init__(self, client: AsyncOpenAI, env: SethEnvironment, tools_manager: ToolsManager | None = None, regulator: SethDynamicRegulator | None = None, memory_tool: SethMemoryTool | None = None):
         self.client = client
         self.env = env
         self.tools_manager = tools_manager
-        self.memory_tool = SethMemoryToolSingleton.get(env)
+        self.memory_tool = memory_tool or SethMemoryTool(env)
         self.regulator = regulator
 
     async def ask(self, messages: list[dict], use_tools: bool = True) -> str:
@@ -621,8 +605,8 @@ class SethShortMemory:
 
 class SethTelegramBot(SethChatBot):
     """Bridges SethChatBot logic to Telegram events using clean state management."""
-    def __init__(self, client: AsyncOpenAI, env: SethEnvironment, tools_manager: ToolsManager | None = None, regulator: SethDynamicRegulator | None = None):
-        super().__init__(client, env, tools_manager, regulator)
+    def __init__(self, client: AsyncOpenAI, env: SethEnvironment, tools_manager: ToolsManager | None = None, regulator: SethDynamicRegulator | None = None,  memory_tool: SethMemoryTool | None = None):
+        super().__init__(client, env, tools_manager, regulator, memory_tool)
         self.short_memory = SethShortMemory(self.env)
         self.system_prompt = self.short_memory.system_prompt()
         
@@ -667,7 +651,7 @@ class SethTelegramBot(SethChatBot):
                     await update.message.reply_text(chunk)
                 else:
                     await update.message.reply_text(f"({i+1}/{len(chunks)})\n\n{chunk}")
-                await asyncio.sleep(0.3)
+                await asyncio.sleep(0.7)
             except Exception as e:
                 logging.error(f"Error sending chunk {i}: {e}")
 
@@ -683,7 +667,10 @@ def main():
     env = SethEnvironment()
     env.validate()
 
-    memory_tool = SethMemoryToolSingleton.get(env)
+    #force singleton init
+    Mem0MemorySingleton.get(env) 
+
+    memory_tool = SethMemoryTool(env)
     search_tool = SethSearchTool()
     inspector_tool = SethSelfInspectorTool()
     tools_manager = ToolsManager()
@@ -781,7 +768,7 @@ def main():
     client = AsyncOpenAI(base_url=env.vllm_url, api_key="dummy")
     regulator = SethDynamicRegulator(state=replace(SethPresets.DEFAULT), env=env)
 
-    bot_ui = SethTelegramBot(client=client, env=env, tools_manager=tools_manager, regulator=regulator)
+    bot_ui = SethTelegramBot(client=client, env=env, tools_manager=tools_manager, regulator=regulator, memory_tool=memory_tool)
     bot_ui.run()
 
 
