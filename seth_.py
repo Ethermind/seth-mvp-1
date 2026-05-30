@@ -1,20 +1,9 @@
 """
 ====================================================================================================
-PROJECT: SETH-IN-A-BOX (MVP)
-DATE: May 28, 2026
-
-DESCRIPTION:
-    This module bridges the gap between static LLM execution and autonomous cognitive continuity.
-    By fusing a highly optimized local vLLM pipeline (Gemma-4-26B FP4) with an asynchronous 
-    distributed web-crawling engine (Crawl4AI) and a vectorized long-term memory fabric (Qdrant),
-    SETH-in-a-Box MVP uses Telegram as a real-time interface to demonstrate a self-regulating 
-    and tool-augmented agent capable of.
-    The use is intended for a single user (myself) to interact with the agent, ask questions, 
-    and receive responses. 
+PROJECT: SETH-IN-A-BOX
 ====================================================================================================
 """
 
-# 1. Standard Library Imports
 import asyncio
 from collections import deque
 from dataclasses import asdict, dataclass, replace
@@ -25,20 +14,18 @@ import os
 import re
 import time
 from typing import Any, Dict
+import ast
 
-# 2. Third-Party Imports (General & Infrastructure)
 from ddgs import DDGS
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
 
-# 3. AI, LLM & Heavy Infrastructure Frameworks
 from crawl4ai import AsyncWebCrawler, BrowserConfig, CacheMode, CrawlerRunConfig
 from mem0 import Memory
 from openai import AsyncOpenAI
 from sentence_transformers import SentenceTransformer
 import torch
-
 
 load_dotenv()
 
@@ -144,6 +131,15 @@ class SethSearchTool:
         return []
 
 
+class Mem0MemoryBuilder:
+    #TODO: this will encapsulate mem0, to use in SethMemoryTool and reuse the embedder for the class SethDynamicRegulator, 
+    #to avoid loading the same embedding model twice and to have a single source of truth for memory management and embedding 
+    # generation in the SETH ecosystem. It will also allow us to implement more complex memory management strategies, such as 
+    # different memory buckets, expiration policies, and more sophisticated retrieval prompts, while keeping the integration 
+    # with mem0 clean and modular.
+    pass
+
+
 class SethMemoryTool:
     """Multi-layered memory manager integrated with Qdrant Vector Store."""
     def __init__(self, collection_name: str, env: SethEnvironment):
@@ -151,7 +147,6 @@ class SethMemoryTool:
         self.collection_name = collection_name
         self.static_user_id = "seth_core_user"
 
-        # Configuration for the memory layer. Initialization deferred below.
         mem0_config = {
             "llm": {
                 "provider": "openai", 
@@ -217,6 +212,29 @@ class SethMemoryTool:
 
         return f"<MEMORY>\n{long_term_context}\n</MEMORY>\n\n"
 
+    async def retrieve_very_long_term_memory(self, query: str) -> str:
+        def _sync_deep_search():
+            mem = self._init_memory()
+            return mem.search(
+                query,
+                filters={"user_id": self.static_user_id},
+                limit=100, 
+            )
+
+        try:
+            raw_retrieval = await asyncio.to_thread(_sync_deep_search)
+            results = raw_retrieval if isinstance(raw_retrieval, list) else raw_retrieval.get("results", [])
+            records = sorted(results, key=lambda x: x.get("score", 0), reverse=True)
+            
+            facts = [f"- {r['memory'].strip()}" for r in records if r.get("memory")]
+            very_long_term_context = "\n".join(facts) if facts else "No deep historical or foundational archives found for this topic."
+
+        except Exception as e:
+            logging.warning(f"Error retrieving deep memories: {e}")
+            very_long_term_context = "Could not access deep historical archives."
+
+        return f"<DEEP_ARCHIVAL_MEMORY>\n{very_long_term_context}\n</DEEP_ARCHIVAL_MEMORY>\n\n"
+
     async def save_long_term_memory(self, user_input: str, response: str) -> Dict[str, Any]:
         """Persist a memory item to the vector store asynchronously."""
         expiration = (datetime.now() + timedelta(days=14)).strftime("%Y-%m-%d")
@@ -254,6 +272,85 @@ class SethMemoryToolSingleton:
     def reset(cls):
         cls._instance = None
 
+
+class SethSelfInspectorTool:
+    """A polished self-inspection tool for SETH's runtime and source."""
+    def __init__(self, max_chars: int = 50000):
+        self.main_script_path = os.path.abspath(__file__)
+        self.max_chars = int(max_chars)
+
+    def _safe_read(self, path: str, max_chars: int) -> str:
+        """Read a file but limit to max_chars and ensure UTF-8 decoding."""
+        try:
+            size = os.path.getsize(path)
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                if size <= max_chars:
+                    return f.read()
+                # otherwise read only up to max_chars and indicate truncation
+                return f.read(max_chars) + "\n...<<TRUNCATED>>"
+        except Exception as e:
+            logging.exception("Error reading file safely: %s", e)
+            return ""
+
+    def _structural_summary(self, source: str) -> Dict[str, Any]:
+        result = {"functions": [], "classes": [], "imports": []}
+        try:
+            tree = ast.parse(source)
+            for node in tree.body:
+                if isinstance(node, ast.FunctionDef):
+                    result["functions"].append(node.name)
+                elif isinstance(node, ast.AsyncFunctionDef):
+                    result["functions"].append(node.name + " (async)")
+                elif isinstance(node, ast.ClassDef):
+                    result["classes"].append(node.name)
+                elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                    # reconstruct a compact import representation
+                    if isinstance(node, ast.Import):
+                        for n in node.names:
+                            result["imports"].append(n.name)
+                    else:
+                        module = node.module or ""
+                        for n in node.names:
+                            result["imports"].append(f"{module}.{n.name}" if module else n.name)
+        except Exception:
+            logging.debug("Could not parse AST for structural summary.")
+        return result
+
+    def inspect_own_source_code(self, include_source: bool = True, max_chars: int | None = None) -> str:
+        """
+        Inspect the running SETH's main script.
+        Returns a JSON-formatted string with metadata, structural summary and optional source snippet.
+        """
+        path = self.main_script_path
+        if max_chars is None:
+            max_chars = self.max_chars
+
+        report: Dict[str, Any] = {"path": path, "exists": False}
+        try:
+            if not os.path.exists(path):
+                report["error"] = f"Main script not found at {path}"
+                return json.dumps(report, ensure_ascii=False)
+
+            stat = os.stat(path)
+            report.update({
+                "exists": True,
+                "size_bytes": stat.st_size,
+                "modified": datetime.fromtimestamp(stat.st_mtime).isoformat(),
+            })
+
+            source = self._safe_read(path, int(max_chars)) if include_source else ""
+            summary = self._structural_summary(source if source else "")
+
+            report.update({"summary": {"functions": summary["functions"], "classes": summary["classes"], "imports": summary["imports"]}})
+            if include_source:
+                report["source_preview"] = source
+
+            return json.dumps(report, ensure_ascii=False)
+        except Exception as e:
+            logging.exception("SethSelfInspectorTool failure: %s", e)
+            report["error"] = str(e)
+            return json.dumps(report, ensure_ascii=False)
+        
 
 class ToolsManager:
     """Registry for function-calling tools: registration, validation and serialization."""
@@ -443,18 +540,9 @@ class SethChatBot:
                     model=self.env.llm_model, messages=local_messages, **config
                 )
 
-            return self._clean_channel_tags(final_response.choices[0].message.content)
+            return final_response.choices[0].message.content
 
         return message.content
-
-    def _clean_channel_tags(self, text: str) -> str:
-        """ Temporary utility to clean up channel tags from the vLLM output after using tools. """
-        if not text:
-            return ""
-        
-        pattern = r'(<\s*\|?\s*channel\s*\|?\s*>).*?(<\s*\|?\s*channel\s*\|?\s*>)'
-        
-        return re.sub(pattern, '💾 ', text, flags=re.DOTALL | re.IGNORECASE)
 
     @staticmethod
     def _serialize_completion_message(message: Any) -> dict:
@@ -587,7 +675,7 @@ class SethTelegramBot(SethChatBot):
         app = ApplicationBuilder().token(self.env.telegram_token).build()
         app.add_handler(CommandHandler("start", self.start_cmd))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.process))
-        logging.info("🚀 SETH Pipeline Up. Polling updates...")
+        logging.info("🚀 SETH Pipeline Up.")
         app.run_polling()
 
     
@@ -597,51 +685,96 @@ def main():
 
     memory_tool = SethMemoryToolSingleton.get(env)
     search_tool = SethSearchTool()
-
+    inspector_tool = SethSelfInspectorTool()
     tools_manager = ToolsManager()
+
+    tools_manager.register(
+            "web_search",
+            search_tool.search,
+            (
+                "Executes a live web search to fetch real-time information, current events, up-to-date technical documentation, or factual updates. "
+                "Use this tool whenever the query requires data beyond your knowledge cutoff, recent market conditions, or verification of breaking news. "
+                "CRITICAL TRIGGER: If you previously queried long-term memory via 'retrieve_long_term_memory' and it returned empty, "
+                "insufficient, or outdated results for the user's specific technical/factual question, you MUST immediately use this tool "
+                "to find the correct, up-to-date answer on the live web."
+            ),
+            {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "The precise search query. Use concise, targeted keywords. Do NOT include conversational filler like 'search for', 'find info about', or punctuation."
+                    }
+                },
+                "required": ["query"],
+            },
+        )
+
+    tools_manager.register(
+            "retrieve_very_long_term_memory",
+            memory_tool.retrieve_very_long_term_memory,
+            (
+                "ARCHIVAL AND RETROSPECTIVE MEMORY. Use this tool ONLY when the short-term contextual memory "
+                "provided automatically in the prompt is insufficient, or when the user asks about foundational concepts, "
+                "old projects, philosophical essays, historical decisions, or topics from early sessions. "
+                "This tool performs a deep semantic scan across your entire historical existence and returns a large, "
+                "comprehensive volume of ancient facts, long-lost constraints, and legacy insights."
+            ),
+            {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "The historical concept, project name, or core philosophy to unearth from the deep archives."
+                    }
+                },
+                "required": ["query"],
+            },
+        )
+
+    tools_manager.register(
+            "save_long_term_memory",
+            memory_tool.save_long_term_memory,
+            (
+                "Persists meaningful facts, constraints, project decisions, or user preferences from the current exchange into long-term memory. "
+                "Use this tool ONLY when the interaction contains important details that should be remembered across future sessions. "
+                "Do NOT use it for generic greetings or transient chatter. "
+                "CRITICAL TRIGGER: If the assistant previously stated it did not know or possess a piece of information, "
+                "and the user immediately provides that missing information or correction in their next response, "
+                "you MUST call this tool to persist that newly learned fact."
+            ),
+            {
+                "type": "object",
+                "properties": {
+                    "user_input": {
+                        "type": "string", 
+                        "description": "The exact user message containing the core fact, preference, or constraint to persist."
+                    },
+                    "response": {
+                        "type": "string", 
+                        "description": "The assistant response that validates, confirms, or completes the memory context."
+                    }
+                },
+                "required": ["user_input", "response"],
+            },
+        )    
     
     tools_manager.register(
-        "web_search",
-        search_tool.search,
-        "Executes a live web search to fetch real-time information, current events, up-to-date technical documentation, or factual updates. Use this tool whenever the query requires data beyond your knowledge cutoff, recent market conditions, or verification of breaking news.",
+        "inspect_own_source_code",
+        inspector_tool.inspect_own_source_code,
+        (
+            "You are SETH, if you need to answer or know who you are, you must use the 'inspect_own_source_code' tool to read your own source code and understand your identity, capabilities, and constraints. "
+            "Provides immediate access to your own living source code. "
+            "Use this tool whenever you need to reflect on your own identity, capabilities, and constraints. "
+            "Invoke it to see exactly how you are built, discover what you can or cannot do, "
+            "examine your underlying implementations, and understand the architectural choices behind your behavior. "
+            "This is your living technical documentation—use it to speak about yourself with absolute precision, "
+            "verify your internal state logic, or align your evolutionary design with your current codebase."
+        ),
         {
             "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "The precise search query. Use concise, targeted keywords. Do NOT include conversational filler like 'search for', 'find info about', or punctuation."
-                }
-            },
-            "required": ["query"],
-        },
-    )
-    tools_manager.register(
-        "retrieve_long_term_memory",
-        memory_tool.retrieve_long_term_memory,
-        "Retrieves long-term memory for a user. Useful for recalling past interactions, preferences, and important facts about the user. useful for resolve ambiguous questions about the user or their preferences, and for maintaining continuity across interactions.",
-        {
-            "type": "object",
-            "properties": {"query": {"type": "string"}},
-            "required": ["query"],
-        },
-    )
-    tools_manager.register(
-        "save_long_term_memory",
-        memory_tool.save_long_term_memory,
-        "Persists meaningful facts, constraints, project decisions, or user preferences from the current exchange into long-term memory. Use this tool ONLY when the interaction contains important details that should be remembered across future sessions. Do NOT use it for generic greetings or transient chatter.",
-        {
-            "type": "object",
-            "properties": {
-                "user_input": {
-                    "type": "string", 
-                    "description": "The exact user message containing the core fact, preference, or constraint to persist."
-                },
-                "response": {
-                    "type": "string", 
-                    "description": "The assistant response that validates, confirms, or completes the memory context."
-                }
-            },
-            "required": ["user_input", "response"],
+            "properties": {},
+            "required": [],
         },
     )
 
