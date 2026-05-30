@@ -5,6 +5,7 @@ PROJECT: SETH-IN-A-BOX
 """
 
 import asyncio
+import base64
 from collections import deque
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta
@@ -433,8 +434,19 @@ class SethDynamicRegulator:
             }
         }
 
-    def adjust_regulated_config(self, query: str) -> Dict[str, Any]:
-        q_vec = self.engine.encode(query, convert_to_tensor=True, normalize_embeddings=True)
+    def adjust_regulated_config(self, query: Any) -> Dict[str, Any]:
+        text_query = ""
+        if isinstance(query, list):
+            for item in query:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    text_query += item.get("text", "")
+        else:
+            text_query = str(query)
+
+        if not text_query.strip():
+            text_query = "neutral"
+
+        q_vec = self.engine.encode(text_query, convert_to_tensor=True, normalize_embeddings=True)
         
         best_name, _ = max(
             ((n, torch.dot(q_vec, d["vector"]).item()) for n, d in self.targets.items()), 
@@ -461,12 +473,25 @@ class SethChatBot:
         local_messages = list(messages)
         last_user_query = local_messages[-1].get("content", "") if local_messages else ""
 
-        if last_user_query:
-            related_context = await self.memory_tool.retrieve_long_term_memory(last_user_query)
-            local_messages[-1] = {
-                "role": local_messages[-1]["role"],
-                "content": f"{related_context}\n\n{last_user_query}"
-            }
+        pure_text_query = ""
+        if isinstance(last_user_query, list):
+            for item in local_messages[-1]["content"]:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    pure_text_query += item.get("text", "")
+        else:
+            pure_text_query = str(last_user_query)
+
+        if pure_text_query.strip():
+            related_context = await self.memory_tool.retrieve_long_term_memory(pure_text_query)
+            if isinstance(local_messages[-1]["content"], list):
+                for item in local_messages[-1]["content"]:
+                    if isinstance(item, dict) and item.get("type") == "text":
+                        item["text"] = f"{related_context}\n\n{item['text']}"
+            else:
+                local_messages[-1] = {
+                    "role": local_messages[-1]["role"],
+                    "content": f"{related_context}\n\n{last_user_query}"
+                }
 
         config = {}
         if self.regulator and last_user_query:
@@ -614,19 +639,53 @@ class SethTelegramBot(SethChatBot):
         await update.message.reply_text("--- SETH ONLINE ---")
 
     async def process(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_text = update.message.text
+        user_text = update.message.text or update.message.caption or ""
+        base64_image = None
+
+        if update.message.photo:
+            await update.message.reply_text("Procesando tu imagen... 📸")
+            await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+            try:
+                photo_file = await context.bot.get_file(update.message.photo[-1].file_id)
+                img_buffer = await photo_file.download_as_bytearray()
+                base64_image = base64.b64encode(img_buffer).decode("utf-8")
+                if not user_text:
+                    user_text = "<DEFAULT_PROMPT>DESCRIBE THE IMAGE AND ITS CONTEXT.<DEFAULT_PROMPT>"
+            except Exception as e:
+                logging.error(f"📸 Error al descargar foto de Telegram: {e}")
+                await update.message.reply_text("❌ No pude procesar el archivo visual que mandaste.")
+                return
+
+        if not user_text and not base64_image:
+            await update.message.reply_text("⚠️ Mandaste un formato no soportado. Tirame texto o imágenes.")
+            return
+
+        if base64_image:
+            user_content = [
+                {"type": "text", "text": user_text},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}
+                }
+            ]
+        else:
+            user_content = user_text
+
         messages = [{"role": "system", "content": self.system_prompt}] + \
                    self.short_memory.get_history_messages() + \
-                   [{"role": "user", "content": user_text}]
+                   [{"role": "user", "content": user_content}]
 
         await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
         
         try:
             response = await self.ask(messages, use_tools=True)
-            self.short_memory.append(user_text, response)
+            
+            # Guardamos en la memoria corta del bot el intercambio (guardamos el texto plano para no inflar la RAM con base64 de turnos viejos)
+            self.short_memory.append(user_text if not base64_image else f"[Foto] {user_text}", response)
+            
             await self._send_message(update, response)
         except Exception as e:
-            logging.exception("Error during seth real-time processing loop.")
+            logging.exception("Error during seth real-time vision processing loop.")
             await update.message.reply_text(f"❌ Error interno de inferencia: {str(e)}")
 
     async def _send_message(self, update: Update, text: str, max_length: int = 4000):
@@ -658,7 +717,7 @@ class SethTelegramBot(SethChatBot):
     def run(self):
         app = ApplicationBuilder().token(self.env.telegram_token).build()
         app.add_handler(CommandHandler("start", self.start_cmd))
-        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.process))
+        app.add_handler(MessageHandler((filters.TEXT | filters.PHOTO) & ~filters.COMMAND, self.process))
         logging.info("🚀 SETH Pipeline Up.")
         app.run_polling()
 
