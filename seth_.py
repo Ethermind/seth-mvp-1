@@ -1,7 +1,5 @@
 """
-====================================================================================================
 PROJECT: SETH-IN-A-BOX
-====================================================================================================
 """
 
 import asyncio
@@ -46,6 +44,7 @@ class SethEnvironment:
     embedding_dims: int = int(os.getenv("EMBEDDING_MODEL_DIMS", 1024))
     system_prompt_path: str = "seth.md"
     log_path: str = "conversation_history.jsonl"
+    state_path: str = "seth.state"
     qdrant_host: str = os.getenv("QDRANT_HOST", "localhost")
     qdrant_port: int = int(os.getenv("QDRANT_PORT", 6333))
 
@@ -76,7 +75,7 @@ class SethSearchTool:
                 run_config = CrawlerRunConfig(
                     cache_mode=CacheMode.BYPASS,
                     word_count_threshold=120,
-                    page_timeout=5000,
+                    page_timeout=7000,
                     wait_for_images=False,
                     process_iframes=False
                 )
@@ -297,40 +296,43 @@ class SethSelfInspectorTool:
             logging.debug("Could not parse AST for structural summary.")
         return result
 
-    def inspect_own_source_code(self, include_source: bool = True, max_chars: int | None = None) -> str:
-        """
-        Inspect the running SETH's main script.
-        Returns a JSON-formatted string with metadata, structural summary and optional source snippet.
-        """
-        path = self.main_script_path
-        if max_chars is None:
-            max_chars = self.max_chars
+    def inspect_own_source_code(
+            self, 
+            reason: str = "No reason provided", 
+            include_source: bool = True, 
+            max_chars: int | None = None
+        ) -> str:
+            logging.info(f"🔍 [SETH SELF-INSPECTION TRIGGERED] Reason: '{reason}'")
 
-        report: Dict[str, Any] = {"path": path, "exists": False}
-        try:
-            if not os.path.exists(path):
-                report["error"] = f"Main script not found at {path}"
+            path = self.main_script_path
+            if max_chars is None:
+                max_chars = self.max_chars
+
+            report: Dict[str, Any] = {"path": path, "exists": False, "inspection_reason": reason}
+            try:
+                if not os.path.exists(path):
+                    report["error"] = f"Main script not found at {path}"
+                    return json.dumps(report, ensure_ascii=False)
+
+                stat = os.stat(path)
+                report.update({
+                    "exists": True,
+                    "size_bytes": stat.st_size,
+                    "modified": datetime.fromtimestamp(stat.st_mtime).isoformat(),
+                })
+
+                source = self._safe_read(path, int(max_chars)) if include_source else ""
+                summary = self._structural_summary(source if source else "")
+
+                report.update({"summary": {"functions": summary["functions"], "classes": summary["classes"], "imports": summary["imports"]}})
+                if include_source:
+                    report["source_preview"] = source
+
                 return json.dumps(report, ensure_ascii=False)
-
-            stat = os.stat(path)
-            report.update({
-                "exists": True,
-                "size_bytes": stat.st_size,
-                "modified": datetime.fromtimestamp(stat.st_mtime).isoformat(),
-            })
-
-            source = self._safe_read(path, int(max_chars)) if include_source else ""
-            summary = self._structural_summary(source if source else "")
-
-            report.update({"summary": {"functions": summary["functions"], "classes": summary["classes"], "imports": summary["imports"]}})
-            if include_source:
-                report["source_preview"] = source
-
-            return json.dumps(report, ensure_ascii=False)
-        except Exception as e:
-            logging.exception("SethSelfInspectorTool failure: %s", e)
-            report["error"] = str(e)
-            return json.dumps(report, ensure_ascii=False)
+            except Exception as e:
+                logging.exception("SethSelfInspectorTool failure: %s", e)
+                report["error"] = str(e)
+                return json.dumps(report, ensure_ascii=False)
         
 
 class ToolsManager:
@@ -376,6 +378,53 @@ class SethState:
         new_tokens = self.max_tokens + alpha * (target.max_tokens - self.max_tokens)
         self.max_tokens = int(new_tokens)
 
+    def save(self, env: SethEnvironment):
+        """Schedules the current hyperparameter state to be persisted asynchronously."""
+        # snapshot
+        filename = env.state_path
+        state_data = self.to_dict()
+        
+        def _sync_write():
+            try:
+                with open(filename, "w", encoding="utf-8") as f:
+                    json.dump(state_data, f, indent=4, ensure_ascii=False)
+                logging.debug(f"💾 [STATE PERSISTED] Metrics dumped to {filename}")
+            except Exception as e:
+                logging.error(f"❌ Error in background thread saving {filename}: {e}")
+
+        try:
+            asyncio.create_task(asyncio.to_thread(_sync_write))
+        except Exception as e:
+            # Fallback
+            _sync_write()
+
+    def load(self, env: SethEnvironment) -> bool:
+        """
+        Loads the latest state from disk. 
+        Returns True if successful, False if file doesn't exist or failed.
+        """
+        filename = env.state_path
+
+        if not os.path.exists(filename):
+            logging.info(f"ℹ️ No previous state file found at {filename}. Using current default values.")
+            return False
+            
+        try:
+            with open(filename, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            
+            # Mappping
+            self.temperature = float(data.get("temperature", self.temperature))
+            self.max_tokens = int(data.get("max_tokens", self.max_tokens))
+            self.top_p = float(data.get("top_p", self.top_p))
+            self.presence_penalty = float(data.get("presence_penalty", self.presence_penalty))
+            
+            logging.info(f"🔄 [STATE LOADED] Continuity restored from {filename} -> Temp: {self.temperature:.3f}")
+            return True
+        except Exception as e:
+            logging.error(f"❌ Error loading seth.state (malformed file?). Keeping defaults. Error: {e}")
+            return False
+        
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
@@ -412,7 +461,7 @@ class SethDynamicRegulator:
         self.alpha = alpha
         self.current_state = state 
         
-        #HACK: to avoid the use SentenceTransformer
+        #HACK: try to avoid the use AGAIN of SentenceTransformer
         try:
             self.engine = Mem0MemorySingleton.get(self.env).embedding_model.model
         except Exception as e:
@@ -436,6 +485,7 @@ class SethDynamicRegulator:
 
     def adjust_regulated_config(self, query: Any) -> Dict[str, Any]:
         text_query = ""
+
         if isinstance(query, list):
             for item in query:
                 if isinstance(item, dict) and item.get("type") == "text":
@@ -454,6 +504,7 @@ class SethDynamicRegulator:
         )
 
         self.current_state.interpolate(self.targets[best_name]["state"], self.alpha)
+        self.current_state.save(self.env)
         
         logging.info(f"🌀 STATE ADJUSTMENT [{best_name.upper()}] - New Temp: {self.current_state.temperature:.3f}")
         return self.current_state.to_dict()
@@ -471,94 +522,107 @@ class SethChatBot:
     async def ask(self, messages: list[dict], use_tools: bool = True) -> str:
         tools = self.tools_manager.as_vllm_format() if (use_tools and self.tools_manager) else None
         local_messages = list(messages)
-        last_user_query = local_messages[-1].get("content", "") if local_messages else ""
 
-        pure_text_query = ""
-        if isinstance(last_user_query, list):
-            for item in local_messages[-1]["content"]:
-                if isinstance(item, dict) and item.get("type") == "text":
-                    pure_text_query += item.get("text", "")
-        else:
-            pure_text_query = str(last_user_query)
+        pure_text_query = self._extract_text_query(local_messages)
+        local_messages = await self._inject_memory_context(local_messages, pure_text_query)
+        config = await self._resolve_inference_config(pure_text_query)
 
-        if pure_text_query.strip():
-            related_context = await self.memory_tool.retrieve_long_term_memory(pure_text_query)
-            if isinstance(local_messages[-1]["content"], list):
-                for item in local_messages[-1]["content"]:
-                    if isinstance(item, dict) and item.get("type") == "text":
-                        item["text"] = f"{related_context}\n\n{item['text']}"
-            else:
-                local_messages[-1] = {
-                    "role": local_messages[-1]["role"],
-                    "content": f"{related_context}\n\n{last_user_query}"
-                }
+        logging.info("🧠 Sending async message to vLLM.")
+        response = await self._llm_call(local_messages, tools, config)
 
-        config = {}
-        if self.regulator and last_user_query:
-            config = await asyncio.to_thread(self.regulator.adjust_regulated_config, last_user_query)
-
-        logging.info(f"🧠 Sending async message to vLLM.")
-        
-        if tools:
-            response = await self.client.chat.completions.create(
-                model=self.env.llm_model, messages=local_messages, tools=tools, tool_choice="auto", **config
-            )
-        else:
-            response = await self.client.chat.completions.create(
-                model=self.env.llm_model, messages=local_messages, **config
-            )
-
-        choice = response.choices[0]
-        message = choice.message
+        message = response.choices[0].message
         local_messages.append(self._serialize_completion_message(message))
 
         if getattr(message, 'tool_calls', None):
-            for tc in message.tool_calls:
-                name = tc.function.name
-                try:
-                    args = json.loads(tc.function.arguments) if tc.function.arguments else {}
-                except Exception:
-                    args = {}
-
-                logging.info(f"🛠️ Executing tool: {name} with args: {args}")
-                fn = self.tools_manager.get_function(name) if (self.tools_manager and name) else None
-                
-                try:
-                    if fn:
-                        maybe_coro = fn(**args)
-                        result = await maybe_coro if asyncio.iscoroutine(maybe_coro) else maybe_coro
-                    else:
-                        result = f"Error: Tool '{name}' not found."
-                except Exception as exc:
-                    result = f"Error executing tool: {str(exc)}"
-
-                local_messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc.id,
-                    "name": name,
-                    "content": str(result)
-                })
-
+            local_messages = await self._execute_tool_calls(message.tool_calls, local_messages)
             logging.info("🧠 Feeding tool results back to the LLM for final synthesis...")
-            if tools:
-                final_response = await self.client.chat.completions.create(
-                    model=self.env.llm_model, messages=local_messages, tools=tools, tool_choice="auto", **config
-                )
-            else:
-                final_response = await self.client.chat.completions.create(
-                    model=self.env.llm_model, messages=local_messages, **config
-                )
+            final_response = await self._llm_call(local_messages, tools, config)
 
             return final_response.choices[0].message.content
 
         return message.content
 
+    def _extract_text_query(self, messages: list[dict]) -> str:
+        """Extract the plain text from the last message, whether it's a string or a multimodal list."""
+        if not messages:
+            return ""
+        
+        content = messages[-1].get("content", "")
+
+        if isinstance(content, list):
+            return "".join(
+                item.get("text", "") for item in content
+                if isinstance(item, dict) and item.get("type") == "text"
+            )
+        
+        return str(content)
+
+    async def _inject_memory_context(self, messages: list[dict], query: str) -> list[dict]:
+        """Recovers long-term memory and injects it as a system message before the last user message."""
+        
+        if not query.strip():
+            return messages
+        
+        related_context = await self.memory_tool.retrieve_long_term_memory(query)
+
+        if "No historical records" not in related_context:
+            # clone to ensure inmutability of input messages and insert memory context before the last user message
+            updated_messages = list(messages)
+            updated_messages.insert(len(updated_messages) - 1, {
+                "role": "system",
+                "content": related_context
+            })
+
+            return updated_messages
+        
+        return messages
+
+    async def _resolve_inference_config(self, query: str) -> dict:
+        """Calculate the dynamic inference configuration based on the query."""
+        if self.regulator and query:
+            return await asyncio.to_thread(self.regulator.adjust_regulated_config, query)
+        
+        return {}
+
+    async def _llm_call(self, messages: list[dict], tools: list | None, config: dict):
+        kwargs = dict(model=self.env.llm_model, messages=messages, **config)
+        if tools:
+            kwargs.update(tools=tools, tool_choice="auto")
+
+        return await self.client.chat.completions.create(**kwargs)
+
+    async def _execute_tool_calls(self, tool_calls, messages: list[dict]) -> list[dict]:
+        for tc in tool_calls:
+            name = tc.function.name
+            try:
+                args = json.loads(tc.function.arguments) if tc.function.arguments else {}
+            except Exception:
+                args = {}
+
+            logging.info(f"🛠️ Executing tool: {name} with args: {args}")
+            fn = self.tools_manager.get_function(name) if (self.tools_manager and name) else None
+
+            try:
+                if fn:
+                    maybe_coro = fn(**args)
+                    result = await maybe_coro if asyncio.iscoroutine(maybe_coro) else maybe_coro
+                else:
+                    result = f"Error: Tool '{name}' not found."
+            except Exception as exc:
+                result = f"Error executing tool: {str(exc)}"
+
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "name": name,
+                "content": str(result)
+            })
+
+        return messages
+
     @staticmethod
     def _serialize_completion_message(message: Any) -> dict:
-        """
-        Converts an OpenAI ChatCompletionMessage into a flat dictionary
-        strictly compatible with vLLM chat templates.
-        """
+        """ Converts an OpenAI ChatCompletionMessage into a flat dictionary strictly compatible with vLLM chat templates. """
         # vLLM and certain formatters fail if content is None instead of an empty string
         content = message.content if message.content is not None else ""
         
@@ -594,10 +658,10 @@ class SethShortMemory:
         if os.path.exists(self.env.system_prompt_path):
             try:
                 with open(self.env.system_prompt_path, "r", encoding="utf-8") as f:
-                    return f"<SYSTEM>\n{f.read()}\n</SYSTEM>"
+                    return f.read()
             except Exception as e:
                 logging.error(f"❌ Error reading system prompt: {e}")
-        return "<SYSTEM>\nREQUEST THE USER TO PROVIDE A VALID SYSTEM PROMPT!.\n</SYSTEM>"
+        return "\n***REQUEST THE USER TO PROVIDE A VALID SYSTEM PROMPT!***\n"
     
     def get_history_messages(self) -> list[dict]:
         return list(self._history)
@@ -650,14 +714,14 @@ class SethTelegramBot(SethChatBot):
                 img_buffer = await photo_file.download_as_bytearray()
                 base64_image = base64.b64encode(img_buffer).decode("utf-8")
                 if not user_text:
-                    user_text = "<DEFAULT_PROMPT>DESCRIBE THE IMAGE AND ITS CONTEXT.<DEFAULT_PROMPT>"
+                    user_text = "Describe the image and its context."
             except Exception as e:
-                logging.error(f"📸 Error al descargar foto de Telegram: {e}")
-                await update.message.reply_text("❌ No pude procesar el archivo visual que mandaste.")
+                logging.error(f"📸 Error downloading photo from Telegram: {e}")
+                await update.message.reply_text("❌ Cannot process the visual file you sent.")
                 return
 
         if not user_text and not base64_image:
-            await update.message.reply_text("⚠️ Mandaste un formato no soportado. Tirame texto o imágenes.")
+            await update.message.reply_text("⚠️ Unsupported format. Please send text or images.")
             return
 
         if base64_image:
@@ -679,14 +743,12 @@ class SethTelegramBot(SethChatBot):
         
         try:
             response = await self.ask(messages, use_tools=True)
-            
-            # Guardamos en la memoria corta del bot el intercambio (guardamos el texto plano para no inflar la RAM con base64 de turnos viejos)
-            self.short_memory.append(user_text if not base64_image else f"[Foto] {user_text}", response)
+            self.short_memory.append(user_text if not base64_image else f"[Picture] {user_text}", response)
             
             await self._send_message(update, response)
         except Exception as e:
             logging.exception("Error during seth real-time vision processing loop.")
-            await update.message.reply_text(f"❌ Error interno de inferencia: {str(e)}")
+            await update.message.reply_text(f"❌ Internal inference error: {str(e)}")
 
     async def _send_message(self, update: Update, text: str, max_length: int = 4000):
         if not text: return
@@ -696,12 +758,22 @@ class SethTelegramBot(SethChatBot):
 
         chunks = []
         current_chunk = ""
+
         for paragraph in text.split('\n'):
+            if len(paragraph) > max_length:
+                if current_chunk:
+                    chunks.append(current_chunk.strip())
+                    current_chunk = ""
+                for i in range(0, len(paragraph), max_length):
+                    chunks.append(paragraph[i:i+max_length].strip())
+                continue
+
             if len(current_chunk) + len(paragraph) + 1 > max_length:
                 if current_chunk: chunks.append(current_chunk.strip())
                 current_chunk = paragraph
             else:
                 current_chunk += "\n" + paragraph if current_chunk else paragraph
+
         if current_chunk: chunks.append(current_chunk.strip())
 
         for i, chunk in enumerate(chunks):
@@ -735,26 +807,33 @@ def main():
     tools_manager = ToolsManager()
 
     tools_manager.register(
-            "web_search",
-            search_tool.search,
-            (
-                "Executes a live web search to fetch real-time information, current events, up-to-date technical documentation, or factual updates. "
-                "Use this tool whenever the query requires data beyond your knowledge cutoff, recent market conditions, or verification of breaking news. "
-                "CRITICAL TRIGGER: If you previously queried long-term memory via 'retrieve_long_term_memory' and it returned empty, "
-                "insufficient, or outdated results for the user's specific technical/factual question, you MUST immediately use this tool "
-                "to find the correct, up-to-date answer on the live web."
-            ),
-            {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "The precise search query. Use concise, targeted keywords. Do NOT include conversational filler like 'search for', 'find info about', or punctuation."
-                    }
-                },
-                "required": ["query"],
+        "web_search",
+        search_tool.search,
+        (
+            "EXECUTION RULES FOR LIVE WEB SEARCH: Executes a live internet search to fetch real-time data, "
+            "current events, market conditions, or breaking updates. "
+            "USE CASES: Use this ONLY for public knowledge that requires real-time accuracy, validation of recent news, "
+            "or up-to-date documentation of external frameworks/libraries. "
+            "CASCADE RESOLUTION PROTOCOL: If a query is about public facts or external technical data, and "
+            "your internal knowledge is insufficient OR 'retrieve_long_term_memory' returned empty/outdated results for that specific public fact, "
+            "you MUST invoke this tool. "
+            "CRITICAL RESTRICTION: Do NOT use this tool if the user is asking about local files, private logs, "
+            "personal source code, or internal project states. For local file inspection, use 'inspect_own_source_code' instead."
+        ),
+        {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": (
+                        "The precise, sanitized search query. Use targeted keywords (e.g., 'fastapi lifespan syntax'). "
+                        "Do NOT include conversational filler, punctuation, or commands like 'search' or 'find'."
+                    )
+                }
             },
-        )
+            "required": ["query"],
+        },
+    )
 
     tools_manager.register(
             "retrieve_very_long_term_memory",
@@ -779,53 +858,69 @@ def main():
         )
 
     tools_manager.register(
-            "save_long_term_memory",
-            memory_tool.save_long_term_memory,
-            (
-                "Persists meaningful facts, constraints, project decisions, or user preferences from the current exchange into long-term memory. "
-                "Use this tool ONLY when the interaction contains important details that should be remembered across future sessions. "
-                "Do NOT use it for generic greetings or transient chatter. "
-                "CRITICAL TRIGGER: If the assistant previously stated it did not know or possess a piece of information, "
-                "and the user immediately provides that missing information or correction in their next response, "
-                "you MUST call this tool to persist that newly learned fact."
-            ),
-            {
-                "type": "object",
-                "properties": {
-                    "user_input": {
-                        "type": "string", 
-                        "description": "The exact user message containing the core fact, preference, or constraint to persist."
-                    },
-                    "response": {
-                        "type": "string", 
-                        "description": "The assistant response that validates, confirms, or completes the memory context."
-                    }
+        "save_long_term_memory",
+        memory_tool.save_long_term_memory,
+        (
+            "Persists meaningful facts, technical constraints, decisions, or user preferences into long-term memory. "
+            "Use this tool whenever the user explicitly asks to remember, save, or persist information, "
+            "or when a crucial new fact/correction is introduced in the exchange."
+        ),
+        {
+            "type": "object",
+            "properties": {
+                "user_input": {
+                    "type": "string", 
+                    "description": (
+                        "The actual core data, fact, or content that needs to be remembered. "
+                        "CRITICAL RULES: "
+                        "1) FOCUS ON THE LATEST EXCHANGE: Target ONLY the specific piece of information, text, or data "
+                        "introduced in the most recent turn. Do NOT merge older history unless explicitly requested. "
+                        "2) EXTRACT THE CONTENT, NOT THE COMMAND: If the user says 'remember that my name is Luis', "
+                        "extract 'The user's name is Luis'. If they say 'save this config' after sharing data, extract the actual data. "
+                        "Never include conversational triggers like 'save this', 'remember', or 'record'."
+                    )
                 },
-                "required": ["user_input", "response"],
+                "response": {
+                    "type": "string", 
+                    "description": "The assistant's short confirmation or validation of the fact being stored."
+                }
             },
-        )    
+            "required": ["user_input", "response"],
+        },
+    )
     
     tools_manager.register(
         "inspect_own_source_code",
         inspector_tool.inspect_own_source_code,
         (
-            "You are SETH, if you need to answer or know who you are, you must use the 'inspect_own_source_code' tool to read your own source code and understand your identity, capabilities, and constraints. "
-            "Provides immediate access to your own living source code. "
-            "Use this tool whenever you need to reflect on your own identity, capabilities, and constraints. "
-            "Invoke it to see exactly how you are built, discover what you can or cannot do, "
-            "examine your underlying implementations, and understand the architectural choices behind your behavior. "
-            "This is your living technical documentation—use it to speak about yourself with absolute precision, "
-            "verify your internal state logic, or align your evolutionary design with your current codebase."
+            "EXECUTION RULES FOR SELF-INSPECTION: Use this tool ALWAYS when the user asks about your source code, "
+            "your internal logic, your Python implementation, or how you are built. "
+            "CRITICAL SYSTEMIC PURPOSES: "
+            "1) SELF-REFERENCE: Read your own script to understand your identity, current class definitions, and active handlers. "
+            "2) CONTEXT DEBUGGING & RECONCILIATION: Invoke this tool immediately if you detect contradictions between your current "
+            "behavior and what the user states about your architecture. Use it to verify your state logic and fix errors. "
+            "TRIGGER KEYWORDS: 'código fuente', 'tu código', 'source code', 'cómo estás programado', 'ver seth.py'."
         ),
         {
             "type": "object",
-            "properties": {},
-            "required": [],
+            "properties": {
+                "reason": {
+                    "type": "string",
+                    "description": (
+                        "A brief, programmatic reason explaining why self-inspection is required "
+                        "(e.g., 'User requested source code check' or 'Resolving architectural contradiction'). "
+                        "This ensures stable JSON formatting for local inference engines."
+                    )
+                }
+            },
+            "required": ["reason"],
         },
     )
 
     client = AsyncOpenAI(base_url=env.vllm_url, api_key="dummy")
-    regulator = SethDynamicRegulator(state=replace(SethPresets.DEFAULT), env=env)
+    current_state = replace(SethPresets.DEFAULT)
+    current_state.load(env)  # Load previous state if it exists
+    regulator = SethDynamicRegulator(state=current_state, env=env)
 
     bot_ui = SethTelegramBot(client=client, env=env, tools_manager=tools_manager, regulator=regulator, memory_tool=memory_tool)
     bot_ui.run()
