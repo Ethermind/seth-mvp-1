@@ -39,12 +39,16 @@ class SethEnvironment:
     """Centralized and typed configuration for the SETH ecosystem."""
     llm_model: str = os.getenv("LLM_MODEL", "nvidia/Gemma-4-26B-A4B-NVFP4")
     vllm_url: str = os.getenv("VLLM_URL", "http://localhost:8000/v1")
+    whisper_url: str = os.getenv("WHISPER_URL", "http://localhost:8010/v1")
+    whisper_model: str = os.getenv("WHISPER_MODEL", "large-v3")
     telegram_token: str = os.getenv("TELEGRAM_TOKEN", "")
     embedding_model: str = os.getenv("EMBEDDING_MODEL", "BAAI/bge-large-en-v1.5")
     embedding_dims: int = int(os.getenv("EMBEDDING_MODEL_DIMS", 1024))
     system_prompt_path: str = "seth.md"
     log_path: str = "conversation_history.jsonl"
     state_path: str = "seth.state"
+    storage_images_dir: str = "storage/images"
+    storage_audio_dir: str = "storage/audio"
     qdrant_host: str = os.getenv("QDRANT_HOST", "localhost")
     qdrant_port: int = int(os.getenv("QDRANT_PORT", 6333))
 
@@ -429,10 +433,9 @@ class SethState:
         return asdict(self)
 
 
-class SethPresets:
+class SethStatePresets:
     """Standardized behavioral states for the SETH ecosystem."""
-    
-    # Static presets for quick access
+   
     DEFAULT = SethState(temperature=0.25, max_tokens=1024, top_p=0.85, presence_penalty=0.2)
     
     @classmethod
@@ -466,20 +469,20 @@ class SethDynamicRegulator:
             self.engine = Mem0MemorySingleton.get(self.env).embedding_model.model
         except Exception as e:
             logging.error(f"Failed to load embedding model from Memory singleton: {e}")
-            self.engine = SentenceTransformer(self.env.embedding_model)
+            self.engine = SentenceTransformer(self.env.embedding_model, device="cuda")
 
         self.targets = {
             "rigorous": {
                 "vector": self.engine.encode("Technical architecture, code precision, logic, systems design", convert_to_tensor=True, normalize_embeddings=True),
-                "state": SethPresets.rigorous()
+                "state": SethStatePresets.rigorous()
             },
             "chaotic": {
                 "vector": self.engine.encode("Glitch aesthetics, humor, creative chaos, fertile glitch", convert_to_tensor=True,normalize_embeddings=True),
-                "state": SethPresets.chaotic()
+                "state": SethStatePresets.chaotic()
             },
             "verbose": {
                 "vector": self.engine.encode("Deep philosophy, ontological analysis, long essay, legacy", convert_to_tensor=True, normalize_embeddings=True),
-                "state": SethPresets.verbose()
+                "state": SethStatePresets.verbose()
             }
         }
 
@@ -694,34 +697,39 @@ class SethShortMemory:
 
 class SethTelegramBot(SethChatBot):
     """Bridges SethChatBot logic to Telegram events using clean state management."""
-    def __init__(self, client: AsyncOpenAI, env: SethEnvironment, tools_manager: ToolsManager | None = None, regulator: SethDynamicRegulator | None = None,  memory_tool: SethMemoryTool | None = None):
+    def __init__(self, client: AsyncOpenAI, env: SethEnvironment, 
+                 tools_manager: ToolsManager | None = None, 
+                 regulator: SethDynamicRegulator | None = None, 
+                 memory_tool: SethMemoryTool | None = None, 
+                 whisper_client: AsyncOpenAI | None = None):
         super().__init__(client, env, tools_manager, regulator, memory_tool)
         self.short_memory = SethShortMemory(self.env)
         self.system_prompt = self.short_memory.system_prompt()
-        
+        self.whisper_client = whisper_client
+
     async def start_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("--- SETH ONLINE ---")
 
     async def process(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Orchestrates Telegram ingestion, structures the multimodal payload, and triggers inference."""
         user_text = update.message.text or update.message.caption or ""
         base64_image = None
 
-        if update.message.photo:
-            await update.message.reply_text("Procesando tu imagen... 📸")
-            await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
-            try:
-                photo_file = await context.bot.get_file(update.message.photo[-1].file_id)
-                img_buffer = await photo_file.download_as_bytearray()
-                base64_image = base64.b64encode(img_buffer).decode("utf-8")
-                if not user_text:
-                    user_text = "Describe the image and its context."
-            except Exception as e:
-                logging.error(f"📸 Error downloading photo from Telegram: {e}")
-                await update.message.reply_text("❌ Cannot process the visual file you sent.")
+        # Audio
+        if update.message.voice or update.message.audio:
+            transcribed_text = await self._handle_voice_message(update, context)
+            if not transcribed_text:
+                return
+            user_text = transcribed_text
+
+        # Images
+        elif update.message.photo:
+            base64_image, user_text = await self._handle_photo_message(update, context, user_text)
+            if not base64_image:
                 return
 
         if not user_text and not base64_image:
-            await update.message.reply_text("⚠️ Unsupported format. Please send text or images.")
+            await update.message.reply_text("⚠️ Formato no soportado.")
             return
 
         if base64_image:
@@ -735,62 +743,110 @@ class SethTelegramBot(SethChatBot):
         else:
             user_content = user_text
 
+        # Memory
         messages = [{"role": "system", "content": self.system_prompt}] + \
                    self.short_memory.get_history_messages() + \
                    [{"role": "user", "content": user_content}]
 
+        # Inference
         await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
-        
         try:
             response = await self.ask(messages, use_tools=True)
-            self.short_memory.append(user_text if not base64_image else f"[Picture] {user_text}", response)
-            
-            await self._send_message(update, response)
+            self.short_memory.append(user_text, response)
+            await update.message.reply_text(response)
         except Exception as e:
             logging.exception("Error during seth real-time vision processing loop.")
             await update.message.reply_text(f"❌ Internal inference error: {str(e)}")
 
-    async def _send_message(self, update: Update, text: str, max_length: int = 4000):
-        if not text: return
-        if len(text) <= max_length:
-            await update.message.reply_text(text)
-            return
+    async def _handle_voice_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> str | None:
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="record_voice")
+        try:
+            os.makedirs(self.env.storage_audio_dir, exist_ok=True)
 
-        chunks = []
-        current_chunk = ""
+            audio_obj = update.message.voice if update.message.voice else update.message.audio
+            audio_file = await context.bot.get_file(audio_obj.file_id)
+            
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            ext = "ogg" if update.message.voice else "mp3"
+            local_path = os.path.join(self.env.storage_audio_dir, f"audio_{timestamp}_{audio_file.file_id[:8]}.{ext}")
+            
+            await audio_file.download_to_drive(custom_path=local_path)
+            logging.info(f"🎙️ [AUDIO SAVED] File written to disk: {local_path}")
 
-        for paragraph in text.split('\n'):
-            if len(paragraph) > max_length:
-                if current_chunk:
-                    chunks.append(current_chunk.strip())
-                    current_chunk = ""
-                for i in range(0, len(paragraph), max_length):
-                    chunks.append(paragraph[i:i+max_length].strip())
-                continue
+            await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
-            if len(current_chunk) + len(paragraph) + 1 > max_length:
-                if current_chunk: chunks.append(current_chunk.strip())
-                current_chunk = paragraph
+            if not self.whisper_client:
+                raise ValueError("Whisper client is not initialized in the pipeline.")
+
+            def _read_audio():
+                with open(local_path, "rb") as f:
+                    return f.read()
+
+            audio_bytes = await asyncio.get_running_loop().run_in_executor(None, _read_audio)
+            
+            audio_tag = f"[Audio: {local_path}]"
+
+            transcription = await self.whisper_client.audio.transcriptions.create(
+                model=self.env.whisper_model,
+                file=(os.path.basename(local_path), audio_bytes)
+            )
+            
+            transcribed_text = transcription.text.strip()
+            logging.info(f"🎙️ [WHISPER TRANSCRIPTION]: '{transcribed_text}'")
+
+            if not transcribed_text:
+                await update.message.reply_text("🔇 Cannot understand the audio.")
+                return None
+
+            return f"{audio_tag} - {transcribed_text}"
+
+        except Exception as e:
+            logging.error(f"🎙️ Error processing audio sub-system: {e}")
+            await update.message.reply_text("❌ Error processing voice message.")
+            return None
+
+    async def _handle_photo_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user_text: str) -> tuple[str | None, str]:
+        """Downloads, caches, and base64-encodes photos safely."""
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+        try:
+            os.makedirs(self.env.storage_images_dir, exist_ok=True)
+
+            photo_file = await context.bot.get_file(update.message.photo[-1].file_id)
+            
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            file_name = f"img_{timestamp}_{photo_file.file_id[:8]}.jpg"
+            local_path = os.path.join(self.env.storage_images_dir, file_name)
+            
+            await photo_file.download_to_drive(custom_path=local_path)
+            logging.info(f"📸 [IMAGE SAVED] {local_path}")
+
+            def _encode_image(path):
+                with open(path, "rb") as image_file:
+                    return base64.b64encode(image_file.read()).decode('utf-8')
+
+            base64_image = await asyncio.get_running_loop().run_in_executor(
+                None, _encode_image, local_path
+            )
+
+            image_tag = f"[Image: {local_path}]"
+
+            if user_text:
+                user_text = f"{image_tag} - {user_text}"
             else:
-                current_chunk += "\n" + paragraph if current_chunk else paragraph
+                user_text = f"{image_tag} - Describe the content of the image and its relevance to the conversation."
+            
+            return base64_image, user_text
 
-        if current_chunk: chunks.append(current_chunk.strip())
-
-        for i, chunk in enumerate(chunks):
-            try:
-                if i == 0:
-                    await update.message.reply_text(chunk)
-                else:
-                    await update.message.reply_text(f"({i+1}/{len(chunks)})\n\n{chunk}")
-                await asyncio.sleep(0.7)
-            except Exception as e:
-                logging.error(f"Error sending chunk {i}: {e}")
+        except Exception as e:
+            logging.error(f"📸 Error processing visual subsystem from Telegram: {e}")
+            await update.message.reply_text("❌ Cannot process or store the visual file you sent.")
+            return None, user_text
 
     def run(self):
         app = ApplicationBuilder().token(self.env.telegram_token).build()
         app.add_handler(CommandHandler("start", self.start_cmd))
-        app.add_handler(MessageHandler((filters.TEXT | filters.PHOTO) & ~filters.COMMAND, self.process))
-        logging.info("🚀 SETH Pipeline Up.")
+        app.add_handler(MessageHandler((filters.TEXT | filters.PHOTO | filters.VOICE | filters.AUDIO) & ~filters.COMMAND, self.process))
+        logging.info("🚀 SETH Pipeline Up with Persistent Local Storage Matrix.")
         app.run_polling()
 
     
@@ -798,8 +854,7 @@ def main():
     env = SethEnvironment()
     env.validate()
 
-    #force singleton init
-    Mem0MemorySingleton.get(env) 
+    Mem0MemorySingleton.get(env) # force init
 
     memory_tool = SethMemoryTool(env)
     search_tool = SethSearchTool()
@@ -917,12 +972,13 @@ def main():
         },
     )
 
-    client = AsyncOpenAI(base_url=env.vllm_url, api_key="dummy")
-    current_state = replace(SethPresets.DEFAULT)
-    current_state.load(env)  # Load previous state if it exists
+    vllm_client = AsyncOpenAI(base_url=env.vllm_url, api_key="dummy")
+    whisper_client = AsyncOpenAI(base_url=env.whisper_url, api_key="dummy_key_not_needed_local")
+    current_state = replace(SethStatePresets.DEFAULT)
+    current_state.load(env)
     regulator = SethDynamicRegulator(state=current_state, env=env)
 
-    bot_ui = SethTelegramBot(client=client, env=env, tools_manager=tools_manager, regulator=regulator, memory_tool=memory_tool)
+    bot_ui = SethTelegramBot(client=vllm_client, env=env, tools_manager=tools_manager, regulator=regulator, memory_tool=memory_tool, whisper_client=whisper_client)
     bot_ui.run()
 
 
