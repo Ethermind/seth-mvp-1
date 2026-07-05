@@ -1,30 +1,34 @@
 """
-PROJECT: SETH-IN-A-BOX
+SETH-IN-A-BOX
 """
 
+import ast
 import asyncio
 import base64
-from collections import deque
-from dataclasses import asdict, dataclass, replace
-from datetime import datetime, timedelta
 import json
 import logging
 import os
 import re
 import time
+from collections import deque
+from dataclasses import asdict, dataclass, replace
+from datetime import datetime, timedelta
 from typing import Any, Dict
-import ast
 
-from ddgs import DDGS
-from dotenv import load_dotenv
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
-
+import torch
+import soundfile as sf
+import numpy as np
 from crawl4ai import AsyncWebCrawler, BrowserConfig, CacheMode, CrawlerRunConfig
+from ddgs import DDGS
+from diffusers import DPMSolverMultistepScheduler, StableDiffusionPipeline
+from dotenv import load_dotenv
 from mem0 import Memory
 from openai import AsyncOpenAI
 from sentence_transformers import SentenceTransformer
-import torch
+from pydub import AudioSegment
+from kokoro import KPipeline
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
 
 load_dotenv()
 
@@ -39,22 +43,32 @@ class SethEnvironment:
     """Centralized and typed configuration for the SETH ecosystem."""
     llm_model: str = os.getenv("LLM_MODEL", "nvidia/Gemma-4-26B-A4B-NVFP4")
     vllm_url: str = os.getenv("VLLM_URL", "http://localhost:8000/v1")
+    whisper_url: str = os.getenv("WHISPER_URL", "http://localhost:8010/v1")
+    whisper_model: str = os.getenv("WHISPER_MODEL", "large-v3")
+    image_model: str = os.getenv("IMAGE_MODEL", "dreamshaper_8.safetensors")
+    image_model_full_path: str = f"models/{image_model}"
     telegram_token: str = os.getenv("TELEGRAM_TOKEN", "")
     embedding_model: str = os.getenv("EMBEDDING_MODEL", "BAAI/bge-large-en-v1.5")
     embedding_dims: int = int(os.getenv("EMBEDDING_MODEL_DIMS", 1024))
     system_prompt_path: str = "seth.md"
     log_path: str = "conversation_history.jsonl"
     state_path: str = "seth.state"
+    storage_images_dir: str = "storage/images"
+    storage_audio_dir: str = "storage/audio"
     qdrant_host: str = os.getenv("QDRANT_HOST", "localhost")
     qdrant_port: int = int(os.getenv("QDRANT_PORT", 6333))
+    max_tokens: int = int(os.getenv("MAX_TOKENS", 32768))
+    api_key: str = os.getenv("API_KEY", "NONE")
 
     def validate(self):
+        """Validates critical environment variables."""
         if not self.telegram_token:
             raise ValueError("❌ TELEGRAM_TOKEN is missing in the environment.")
+        logging.info("✅ Environment configuration successfully validated.")
 
 
 class SethSearchTool:
-    """Web retrieval and extraction tool powered by DuckDuckGo and Crawl4AI."""
+    """Web retrieval and extraction tool"""
     def __init__(self):
         self.browser_config = BrowserConfig(headless=True, verbose=False)
         self._crawl_semaphore = asyncio.Semaphore(3)
@@ -138,10 +152,10 @@ class Mem0MemoryBuilder:
         self.mem0_config = {
             "llm": {
                 "provider": "openai", 
-                "config": {"model": env.llm_model, "openai_base_url": env.vllm_url, "api_key": "dummy_key"}
+                "config": {"model": env.llm_model, "openai_base_url": env.vllm_url, "api_key": env.api_key}
             },
             "embedder": {
-                "provider": "huggingface", 
+                "provider": "huggingface",
                 "config": {"model": env.embedding_model}
             },
             "vector_store": {
@@ -333,7 +347,176 @@ class SethSelfInspectorTool:
                 logging.exception("SethSelfInspectorTool failure: %s", e)
                 report["error"] = str(e)
                 return json.dumps(report, ensure_ascii=False)
+
+
+class SethImageGenerationTool:
+    """Image generation tool optimized for using the secondary GPU."""
+    def __init__(self, env: SethEnvironment):
+        self.env = env
+        os.makedirs(self.env.storage_images_dir, exist_ok=True)
+        gpus = torch.cuda.device_count()
+        self.device = torch.device("cuda:1") if gpus > 1 else torch.device("cuda:0")
+        logging.info(f"🎨 [IMAGE SYSTEM INIT] device: {self.device}")
+        self._pipe = None
+
+        # Cleanup task and lock for managing idle GPU resources
+        self._cleanup_task = None
+        self._lock = asyncio.Lock()
+        self.idle_timeout_secs = 300
+
+    def _init_pipeline(self):
+        if self._pipe is None:
+            logging.info(f"⏳ Loading Image Pipeline from [{self.env.image_model}] on {self.device}...")
+            try:
+                pipe = StableDiffusionPipeline.from_single_file(
+                    self.env.image_model_full_path,
+                    torch_dtype=torch.float16,
+                    use_safetensors=True,
+                    safety_checker=None,
+                    requires_safety_checker=False
+                )
+                pipe = pipe.to(self.device)
+                
+                # DPM++ 2M Karras
+                pipe.scheduler = DPMSolverMultistepScheduler.from_config(
+                    pipe.scheduler.config,
+                    use_karras_sigmas=True
+                )
+                
+                pipe.enable_attention_slicing()
+                
+                self._pipe = pipe
+            except Exception as e:
+                logging.error(f"❌ CRITICAL error initializing Image Pipeline: {e}")
+                raise e
+
+        return self._pipe
+
+    def _sync_generate(self, prompt: str) -> str:
+        try:
+            pipe = self._init_pipeline()
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"gen_{timestamp}_{int(time.time()) % 10000}.png"
+            output_path = os.path.join(self.env.storage_images_dir, filename)
+
+            logging.info(f"🚀 Rendering image from: '{prompt}'")
+            image = pipe(
+                prompt=prompt,
+                negative_prompt="bad anatomy, blurry, low quality, deformed, bad hands, mutated, disfigured",
+                num_inference_steps=25,
+                guidance_scale=7.5,
+                width=512,
+                height=512
+            ).images[0]
+
+            image.save(output_path)
+            return output_path
+        except Exception as e:
+            logging.error(f"❌ Image generation error on GPU {self.device}: {e}")
+            raise e
+
+    async def generate_image(self, prompt: str) -> str:
+        logging.info(f"🖼️ Received image generation request with prompt: '{prompt}'")
+        async with self._lock:
+            if self._cleanup_task and not self._cleanup_task.done():
+                self._cleanup_task.cancel()
+                logging.info("⏱️ Active VRAM cleanup timer reset due to new request.")
+
+            try:
+                file_path = await asyncio.to_thread(self._sync_generate, prompt)
+                self._cleanup_task = asyncio.create_task(self._vram_cleanup_timer())
+                
+                report = {
+                    "status": "success",
+                    "local_path": file_path,
+                    "message": f"Image generated successfully. File saved locally at {file_path}. Inform the user that the image is now available."
+                }
+                return json.dumps(report, ensure_ascii=False)
+            except Exception as e:
+                self._cleanup_task = asyncio.create_task(self._vram_cleanup_timer())
+                return json.dumps({"status": "error", "error": str(e)}, ensure_ascii=False)
+
+    async def _vram_cleanup_timer(self):
+        """Waits in the background without blocking. If it expires, it unloads the model."""
+        try:
+            await asyncio.sleep(self.idle_timeout_secs)
+            async with self._lock:
+                if self._pipe is not None:
+                    logging.info(f"♻️ [VRAM CLEANUP] 5 min of inactivity reached. Unloading Image Pipeline from {self.device}...")
+                    self._pipe = None
+                    if "cuda" in str(self.device):
+                        torch.cuda.empty_cache()
+                    logging.info("♻️ [VRAM CLEANUP] VRAM successfully released.")
+        except asyncio.CancelledError as e:
+            logging.error(f"❌ [VRAM CLEANUP ERROR] {e}")
+            pass
+
+
+class SethSpeechGenerationTool:
+    """Voice generation tool using kokoro TTS engine for Spanish."""
+    def __init__(self, env: "SethEnvironment"):
+        self.env = env
+        self.storage_audio_dir = os.path.join("storage", "audio")
+        os.makedirs(self.storage_audio_dir, exist_ok=True)
+        self.lang_code = "e" 
+        self._pipeline = None
+        self._lock = asyncio.Lock()
+        logging.info("🔊 [SPEECH SYSTEM INIT] Kokoro initialized for Spanish.")
+
+    def _init_tts(self):
+        if self._pipeline is None:
+            logging.info("⏳ KPipeline...")
+            try:
+                self._pipeline = KPipeline(lang_code=self.lang_code)
+                logging.info("✅ KPipeline... OK!")
+            except Exception as e:
+                logging.error(f"❌ Error initializing KPipeline: {e}")
+                raise e
+        return self._pipeline
+
+    def _sync_generate_audio(self, text: str, wav_path: str, mp3_path: str):
+        pipeline_engine = self._init_tts()
+        generator = pipeline_engine(text, voice="ef_dora", speed=1.0)
         
+        audio_chunks = []
+        sample_rate = 24000
+        
+        for i, (gs, ps, audio) in enumerate(generator):
+            audio_chunks.append(audio)
+            
+        if not audio_chunks:
+            raise ValueError("No audio chunks generated.")
+
+        final_audio = np.concatenate(audio_chunks)
+        
+        sf.write(wav_path, final_audio, sample_rate)
+        AudioSegment.from_wav(wav_path).export(mp3_path, format="mp3")
+        if os.path.exists(wav_path):
+            os.remove(wav_path)
+
+    async def generate_speech(self, text: str) -> str:
+        logging.info(f"🎙️ [KOKORO TTS] Petición de audio recibida para: '{text[:40]}...'")
+        async with self._lock:
+            try:
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                base_filename = f"speech_{timestamp}_{int(time.time()) % 10000}"
+                
+                wav_path = os.path.join(self.storage_audio_dir, f"{base_filename}.wav")
+                mp3_path = os.path.join(self.storage_audio_dir, f"{base_filename}.mp3")
+                
+                await asyncio.to_thread(self._sync_generate_audio, text, wav_path, mp3_path)
+                
+                report = {
+                    "status": "success",
+                    "local_path": mp3_path,
+                    "message": f"Audio generated successfully. File saved locally at {mp3_path}. Send this file to the user indicating full path."
+                }
+                return json.dumps(report, ensure_ascii=False)
+                
+            except Exception as e:
+                logging.error(f"❌ Kokoro ERROR: {e}")
+                return json.dumps({"status": "error", "error": str(e)}, ensure_ascii=False)
+
 
 class ToolsManager:
     """Registry for function-calling tools: registration, validation and serialization."""
@@ -364,7 +547,7 @@ class ToolsManager:
 
 @dataclass
 class SethState:
-    """Represents the agent's dynamic inference state (Temperature, Tokens, etc.)."""
+    """Represents Seth's dynamic inference state"""
     temperature: float
     max_tokens: int
     top_p: float
@@ -380,42 +563,30 @@ class SethState:
 
     def save(self, env: SethEnvironment):
         """Schedules the current hyperparameter state to be persisted asynchronously."""
-        # snapshot
         filename = env.state_path
         state_data = self.to_dict()
-        
-        def _sync_write():
-            try:
-                with open(filename, "w", encoding="utf-8") as f:
-                    json.dump(state_data, f, indent=4, ensure_ascii=False)
-                logging.debug(f"💾 [STATE PERSISTED] Metrics dumped to {filename}")
-            except Exception as e:
-                logging.error(f"❌ Error in background thread saving {filename}: {e}")
 
         try:
-            asyncio.create_task(asyncio.to_thread(_sync_write))
+            with open(filename, "w", encoding="utf-8") as f:
+                json.dump(state_data, f, indent=4, ensure_ascii=False)
+            logging.debug(f"💾 [STATE PERSISTED] Metrics dumped to {filename}")
         except Exception as e:
-            # Fallback
-            _sync_write()
+            logging.error(f"❌ Error in background thread saving {filename}: {e}")
 
     def load(self, env: SethEnvironment) -> bool:
-        """
-        Loads the latest state from disk. 
-        Returns True if successful, False if file doesn't exist or failed.
-        """
         filename = env.state_path
 
         if not os.path.exists(filename):
-            logging.info(f"ℹ️ No previous state file found at {filename}. Using current default values.")
+            logging.info(f"ℹ️ No previous state file found at {filename}. Using default values.")
             return False
             
         try:
             with open(filename, "r", encoding="utf-8") as f:
                 data = json.load(f)
             
-            # Mappping
             self.temperature = float(data.get("temperature", self.temperature))
             self.max_tokens = int(data.get("max_tokens", self.max_tokens))
+            #self.max_tokens = env.max_tokens TODO: consider if we want to enforce the env max_tokens or allow state persistence
             self.top_p = float(data.get("top_p", self.top_p))
             self.presence_penalty = float(data.get("presence_penalty", self.presence_penalty))
             
@@ -429,10 +600,9 @@ class SethState:
         return asdict(self)
 
 
-class SethPresets:
+class SethStatePresets:
     """Standardized behavioral states for the SETH ecosystem."""
-    
-    # Static presets for quick access
+   
     DEFAULT = SethState(temperature=0.25, max_tokens=1024, top_p=0.85, presence_penalty=0.2)
     
     @classmethod
@@ -459,27 +629,29 @@ class SethDynamicRegulator:
     def __init__(self, state: Any, env: SethEnvironment, alpha: float = 0.2):
         self.env = env
         self.alpha = alpha
-        self.current_state = state 
+        self.current_state = state
+        self._state_lock = asyncio.Lock()
         
         #HACK: try to avoid the use AGAIN of SentenceTransformer
         try:
             self.engine = Mem0MemorySingleton.get(self.env).embedding_model.model
         except Exception as e:
             logging.error(f"Failed to load embedding model from Memory singleton: {e}")
-            self.engine = SentenceTransformer(self.env.embedding_model)
+            logging.info(f"Loading embedding model using SentenceTransformer: {self.env.embedding_model}")
+            self.engine = SentenceTransformer(self.env.embedding_model, device="cuda")
 
         self.targets = {
             "rigorous": {
                 "vector": self.engine.encode("Technical architecture, code precision, logic, systems design", convert_to_tensor=True, normalize_embeddings=True),
-                "state": SethPresets.rigorous()
+                "state": SethStatePresets.rigorous()
             },
             "chaotic": {
                 "vector": self.engine.encode("Glitch aesthetics, humor, creative chaos, fertile glitch", convert_to_tensor=True,normalize_embeddings=True),
-                "state": SethPresets.chaotic()
+                "state": SethStatePresets.chaotic()
             },
             "verbose": {
                 "vector": self.engine.encode("Deep philosophy, ontological analysis, long essay, legacy", convert_to_tensor=True, normalize_embeddings=True),
-                "state": SethPresets.verbose()
+                "state": SethStatePresets.verbose()
             }
         }
 
@@ -508,6 +680,10 @@ class SethDynamicRegulator:
         
         logging.info(f"🌀 STATE ADJUSTMENT [{best_name.upper()}] - New Temp: {self.current_state.temperature:.3f}")
         return self.current_state.to_dict()
+
+    async def async_adjust_regulated_config(self, query: Any) -> Dict[str, Any]:
+        async with self._state_lock:
+            return await asyncio.to_thread(self.adjust_regulated_config, query)
 
 
 class SethChatBot:
@@ -566,7 +742,6 @@ class SethChatBot:
         related_context = await self.memory_tool.retrieve_long_term_memory(query)
 
         if "No historical records" not in related_context:
-            # clone to ensure inmutability of input messages and insert memory context before the last user message
             updated_messages = list(messages)
             updated_messages.insert(len(updated_messages) - 1, {
                 "role": "system",
@@ -580,7 +755,7 @@ class SethChatBot:
     async def _resolve_inference_config(self, query: str) -> dict:
         """Calculate the dynamic inference configuration based on the query."""
         if self.regulator and query:
-            return await asyncio.to_thread(self.regulator.adjust_regulated_config, query)
+            return await self.regulator.async_adjust_regulated_config(query)
         
         return {}
 
@@ -589,41 +764,73 @@ class SethChatBot:
         if tools:
             kwargs.update(tools=tools, tool_choice="auto")
 
+        # Dynamic context protection
+        total_chars = 0
+        for m in messages:
+            content = m.get("content", "")
+            if isinstance(content, list):
+                for item in content:
+                    if isinstance(item, dict) and item.get("type") == "text":
+                        total_chars += len(item.get("text", ""))
+            else:
+                total_chars += len(str(content))
+        
+        estimated_input_tokens = int((total_chars / 4) * 1.25)
+        max_allowed_context = self.env.max_tokens
+        available_output_slots = max_allowed_context - estimated_input_tokens
+        requested_output = kwargs.get("max_tokens", 1024)
+
+        if requested_output > available_output_slots:
+            adjusted_output = max(512, available_output_slots - 50)
+            logging.warning(
+                f"⚠️ [CONTEXT OVERFLOW GUARD] Prompt denso ({estimated_input_tokens} tks). "
+                f"Recortando max_tokens de {requested_output} a {adjusted_output} para no desbordar vLLM."
+            )
+            kwargs["max_tokens"] = adjusted_output
+
         return await self.client.chat.completions.create(**kwargs)
 
+    async def _run_single_tool_call(self, tc) -> dict:
+        """Executes one tool call and returns its message dict. Never raises —
+        errors are captured into the tool result so one bad call can't sink the batch."""
+        name = tc.function.name
+        try:
+            args = json.loads(tc.function.arguments) if tc.function.arguments else {}
+        except Exception:
+            args = {}
+
+        logging.info(f"🛠️ Executing tool: {name} with args: {args}")
+        fn = self.tools_manager.get_function(name) if (self.tools_manager and name) else None
+
+        try:
+            if fn:
+                maybe_coro = fn(**args)
+                result = await maybe_coro if asyncio.iscoroutine(maybe_coro) else maybe_coro
+            else:
+                result = f"Error: Tool '{name}' not found."
+        except Exception as exc:
+            result = f"Error executing tool: {str(exc)}"
+
+        return {
+            "role": "tool",
+            "tool_call_id": tc.id,
+            "name": name,
+            "content": str(result)
+        }
+
     async def _execute_tool_calls(self, tool_calls, messages: list[dict]) -> list[dict]:
-        for tc in tool_calls:
-            name = tc.function.name
-            try:
-                args = json.loads(tc.function.arguments) if tc.function.arguments else {}
-            except Exception:
-                args = {}
-
-            logging.info(f"🛠️ Executing tool: {name} with args: {args}")
-            fn = self.tools_manager.get_function(name) if (self.tools_manager and name) else None
-
-            try:
-                if fn:
-                    maybe_coro = fn(**args)
-                    result = await maybe_coro if asyncio.iscoroutine(maybe_coro) else maybe_coro
-                else:
-                    result = f"Error: Tool '{name}' not found."
-            except Exception as exc:
-                result = f"Error executing tool: {str(exc)}"
-
-            messages.append({
-                "role": "tool",
-                "tool_call_id": tc.id,
-                "name": name,
-                "content": str(result)
-            })
-
+        """Runs every tool call the model requested concurrently instead of one-by-one.
+        asyncio.gather preserves the order of results to match the order of tool_calls,
+        regardless of which one finishes first, so tool_call_id pairing stays correct."""
+        tool_messages = await asyncio.gather(
+            *(self._run_single_tool_call(tc) for tc in tool_calls)
+        )
+        messages.extend(tool_messages)
         return messages
 
     @staticmethod
     def _serialize_completion_message(message: Any) -> dict:
         """ Converts an OpenAI ChatCompletionMessage into a flat dictionary strictly compatible with vLLM chat templates. """
-        # vLLM and certain formatters fail if content is None instead of an empty string
         content = message.content if message.content is not None else ""
         
         msg_dict = {
@@ -649,10 +856,12 @@ class SethChatBot:
 
 class SethShortMemory:
     """Manages short-term conversational context window using an atomic sliding queue and persists logs."""
-    def __init__(self, env: SethEnvironment, max_history: int = 40):
+    def __init__(self, env: SethEnvironment, max_history: int = 10):
         self.env = env
-        self._history = deque(maxlen=max_history * 2)
+        self._max_history = max_history
+        self._history = deque(maxlen=self._max_history * 2)
         self._file_lock = asyncio.Lock()
+        self._load_legacy_history()
 
     def system_prompt(self) -> str:
         if os.path.exists(self.env.system_prompt_path):
@@ -671,9 +880,44 @@ class SethShortMemory:
         self._history.append({"role": "user", "content": text})
         self._history.append({"role": "assistant", "content": response})
         
-        asyncio.create_task(self._write_to_jsonl_async(text, response))
+        asyncio.create_task(self._write(text, response))
 
-    async def _write_to_jsonl_async(self, text: str, response: str):
+    def _load_legacy_history(self):
+        if not os.path.exists(self.env.log_path):
+            logging.info(f"ℹ️ {self.env.log_path} not found.")
+            return
+
+        try:
+            logging.info(f"⏳ Loading long term context from {self.env.log_path}...")
+            temp_turns = []
+            
+            with open(self.env.log_path, "r", encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()
+
+            target_lines = lines[-self._max_history:]
+
+            for line in target_lines:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                    turns = data.get("turns", [])
+                    if len(turns) == 2:
+                        temp_turns.append(turns[0]) # User
+                        temp_turns.append(turns[1]) # Assistant
+                except json.JSONDecodeError:
+                    continue
+
+            for msg in temp_turns:
+                self._history.append(msg)
+
+            logging.info(f"🔄 [MEMORY RESTORED] {len(self._history) // 2} previous interactions restored.")
+            
+        except Exception as e:
+            logging.error(f"❌ Failed to load persistent history: {e}")
+
+    async def _write(self, text: str, response: str):
         def _sync_write():
             log_entry = {
                 "timestamp": datetime.now().isoformat(),
@@ -694,34 +938,39 @@ class SethShortMemory:
 
 class SethTelegramBot(SethChatBot):
     """Bridges SethChatBot logic to Telegram events using clean state management."""
-    def __init__(self, client: AsyncOpenAI, env: SethEnvironment, tools_manager: ToolsManager | None = None, regulator: SethDynamicRegulator | None = None,  memory_tool: SethMemoryTool | None = None):
+    def __init__(self, client: AsyncOpenAI, env: SethEnvironment, 
+                 tools_manager: ToolsManager | None = None, 
+                 regulator: SethDynamicRegulator | None = None, 
+                 memory_tool: SethMemoryTool | None = None, 
+                 whisper_client: AsyncOpenAI | None = None):
         super().__init__(client, env, tools_manager, regulator, memory_tool)
         self.short_memory = SethShortMemory(self.env)
         self.system_prompt = self.short_memory.system_prompt()
-        
+        self.whisper_client = whisper_client
+
     async def start_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text("--- SETH ONLINE ---")
+        await update.message.reply_text("--- [SETH IS ONLINE] ---")
 
     async def process(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Orchestrates Telegram ingestion, structures the multimodal payload, and triggers inference."""
         user_text = update.message.text or update.message.caption or ""
         base64_image = None
 
-        if update.message.photo:
-            await update.message.reply_text("Procesando tu imagen... 📸")
-            await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
-            try:
-                photo_file = await context.bot.get_file(update.message.photo[-1].file_id)
-                img_buffer = await photo_file.download_as_bytearray()
-                base64_image = base64.b64encode(img_buffer).decode("utf-8")
-                if not user_text:
-                    user_text = "Describe the image and its context."
-            except Exception as e:
-                logging.error(f"📸 Error downloading photo from Telegram: {e}")
-                await update.message.reply_text("❌ Cannot process the visual file you sent.")
+        # Audio
+        if update.message.voice or update.message.audio:
+            transcribed_text = await self._handle_voice_message(update, context)
+            if not transcribed_text:
+                return
+            user_text = transcribed_text
+
+        # Images
+        elif update.message.photo:
+            base64_image, user_text = await self._handle_photo_message(update, context, user_text)
+            if not base64_image:
                 return
 
         if not user_text and not base64_image:
-            await update.message.reply_text("⚠️ Unsupported format. Please send text or images.")
+            await update.message.reply_text("⚠️ Unsupported format.")
             return
 
         if base64_image:
@@ -735,46 +984,169 @@ class SethTelegramBot(SethChatBot):
         else:
             user_content = user_text
 
+        # Memory
         messages = [{"role": "system", "content": self.system_prompt}] + \
                    self.short_memory.get_history_messages() + \
                    [{"role": "user", "content": user_content}]
 
+        # Inference
         await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
-        
         try:
             response = await self.ask(messages, use_tools=True)
-            self.short_memory.append(user_text if not base64_image else f"[Picture] {user_text}", response)
-            
-            await self._send_message(update, response)
+ 
+            match_image = re.search(r"storage/images/[\w\-_]+\.png", response)
+            if match_image:
+                detected_path = match_image.group(0)
+                if os.path.exists(detected_path):
+                    logging.info(f"📸 Detected image path in response: {detected_path}. Sending photo to Telegram.")
+                    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="upload_photo")
+                    with open(detected_path, "rb") as photo:
+                        await update.message.reply_photo(photo=photo)
+                    return
+
+            match_audio = re.search(r"(?:storage/)?audio/([\w\-_]+\.mp3)", response)
+            if match_audio:
+                detected_audio_path = match_audio.group(0)
+                if os.path.exists(detected_audio_path):
+                    logging.info(f"📁 Detected audio path in response: {detected_audio_path}. Transmitting voice note.")
+                    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="record_voice")
+                    with open(detected_audio_path, "rb") as audio_file:
+                        await update.message.reply_voice(voice=audio_file)
+                    return
+
+            self.short_memory.append(user_text, response)
+
+            await self._send_long_message(update, response)
         except Exception as e:
             logging.exception("Error during seth real-time vision processing loop.")
             await update.message.reply_text(f"❌ Internal inference error: {str(e)}")
+                        
 
-    async def _send_message(self, update: Update, text: str, max_length: int = 4000):
-        if not text: return
+    async def _handle_voice_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> str | None:
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="record_voice")
+        try:
+            os.makedirs(self.env.storage_audio_dir, exist_ok=True)
+
+            audio_obj = update.message.voice if update.message.voice else update.message.audio
+            audio_file = await context.bot.get_file(audio_obj.file_id)
+            
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            ext = "ogg" if update.message.voice else "mp3"
+            local_path = os.path.join(self.env.storage_audio_dir, f"audio_{timestamp}_{audio_file.file_id[:8]}.{ext}")
+            
+            await audio_file.download_to_drive(custom_path=local_path)
+            logging.info(f"🎙️ [AUDIO SAVED] File written to disk: {local_path}")
+
+            await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+
+            if not self.whisper_client:
+                raise ValueError("Whisper client is not initialized in the pipeline.")
+
+            def _read_audio():
+                with open(local_path, "rb") as f:
+                    return f.read()
+
+            audio_bytes = await asyncio.get_running_loop().run_in_executor(None, _read_audio)
+            
+            audio_tag = f"[Audio: {local_path}]"
+
+            transcription = await self.whisper_client.audio.transcriptions.create(
+                model=self.env.whisper_model,
+                file=(os.path.basename(local_path), audio_bytes)
+            )
+            
+            transcribed_text = transcription.text.strip()
+            logging.info(f"🎙️ [WHISPER TRANSCRIPTION]: '{transcribed_text}'")
+
+            if not transcribed_text:
+                await update.message.reply_text("🔇 Cannot understand the audio.")
+                return None
+
+            return f"{audio_tag} - {transcribed_text}"
+
+        except Exception as e:
+            logging.error(f"🎙️ Error processing audio sub-system: {e}")
+            await update.message.reply_text("❌ Error processing voice message.")
+            return None
+
+    async def _handle_photo_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user_text: str) -> tuple[str | None, str]:
+        """Downloads, caches, and base64-encodes photos safely."""
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+        try:
+            os.makedirs(self.env.storage_images_dir, exist_ok=True)
+
+            photo_file = await context.bot.get_file(update.message.photo[-1].file_id)
+            
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            file_name = f"img_{timestamp}_{photo_file.file_id[:8]}.jpg"
+            local_path = os.path.join(self.env.storage_images_dir, file_name)
+            
+            await photo_file.download_to_drive(custom_path=local_path)
+            logging.info(f"📸 [IMAGE SAVED] {local_path}")
+
+            def _encode_image(path):
+                with open(path, "rb") as image_file:
+                    return base64.b64encode(image_file.read()).decode('utf-8')
+
+            base64_image = await asyncio.get_running_loop().run_in_executor(
+                None, _encode_image, local_path
+            )
+
+            image_tag = f"[Image: {local_path}]"
+
+            if user_text:
+                user_text = f"{image_tag} - {user_text}"
+            else:
+                user_text = f"{image_tag} - Describe the content of the image and its relevance to the conversation."
+            
+            return base64_image, user_text
+
+        except Exception as e:
+            logging.error(f"📸 Error processing Vision from Telegram: {e}")
+            await update.message.reply_text("❌ Cannot process or store the visual file you sent.")
+            return None, user_text
+
+    async def _send_long_message(self, update: Update, text: str, max_length: int = 4096):
+        """Sends long messages by splitting them automatically while safely keeping Markdown code blocks intact."""
+        if not text:
+            return
+
         if len(text) <= max_length:
             await update.message.reply_text(text)
             return
 
         chunks = []
         current_chunk = ""
+        in_code_block = False
+        current_language = ""
 
-        for paragraph in text.split('\n'):
-            if len(paragraph) > max_length:
+        lines = text.split('\n')
+
+        for line in lines:
+            if line.strip().startswith("```"):
+                in_code_block = not in_code_block
+                if in_code_block:
+                    current_language = line.strip()[3:].strip()
+                else:
+                    current_language = ""
+
+            if len(current_chunk) + len(line) + 50 > max_length:
                 if current_chunk:
+                    if in_code_block:
+                        current_chunk += "\n```"
                     chunks.append(current_chunk.strip())
-                    current_chunk = ""
-                for i in range(0, len(paragraph), max_length):
-                    chunks.append(paragraph[i:i+max_length].strip())
-                continue
-
-            if len(current_chunk) + len(paragraph) + 1 > max_length:
-                if current_chunk: chunks.append(current_chunk.strip())
-                current_chunk = paragraph
+                
+                if in_code_block:
+                    current_chunk = f"``` {current_language}\n{line}"
+                else:
+                    current_chunk = line
             else:
-                current_chunk += "\n" + paragraph if current_chunk else paragraph
+                current_chunk += "\n" + line if current_chunk else line
 
-        if current_chunk: chunks.append(current_chunk.strip())
+        if current_chunk:
+            if in_code_block and not current_chunk.strip().endswith("```"):
+                current_chunk += "\n```"
+            chunks.append(current_chunk.strip())
 
         for i, chunk in enumerate(chunks):
             try:
@@ -782,15 +1154,19 @@ class SethTelegramBot(SethChatBot):
                     await update.message.reply_text(chunk)
                 else:
                     await update.message.reply_text(f"({i+1}/{len(chunks)})\n\n{chunk}")
-                await asyncio.sleep(0.7)
+                
+                await asyncio.sleep(0.3)
+                
             except Exception as e:
                 logging.error(f"Error sending chunk {i}: {e}")
+                await update.message.reply_text("⚠️ The response is too long. Here's a part:")
+                await update.message.reply_text(chunk[:3500])
 
     def run(self):
         app = ApplicationBuilder().token(self.env.telegram_token).build()
         app.add_handler(CommandHandler("start", self.start_cmd))
-        app.add_handler(MessageHandler((filters.TEXT | filters.PHOTO) & ~filters.COMMAND, self.process))
-        logging.info("🚀 SETH Pipeline Up.")
+        app.add_handler(MessageHandler((filters.TEXT | filters.PHOTO | filters.VOICE | filters.AUDIO) & ~filters.COMMAND, self.process))
+        logging.info("🚀 SETH Pipeline Up with Persistent Local Storage Matrix.")
         app.run_polling()
 
     
@@ -798,12 +1174,13 @@ def main():
     env = SethEnvironment()
     env.validate()
 
-    #force singleton init
-    Mem0MemorySingleton.get(env) 
+    Mem0MemorySingleton.get(env) # force init
 
-    memory_tool = SethMemoryTool(env)
+    memory_tool = SethMemoryTool(env=env)
     search_tool = SethSearchTool()
     inspector_tool = SethSelfInspectorTool()
+    image_tool = SethImageGenerationTool(env=env)
+    speech_tool = SethSpeechGenerationTool(env=env)
     tools_manager = ToolsManager()
 
     tools_manager.register(
@@ -917,12 +1294,63 @@ def main():
         },
     )
 
-    client = AsyncOpenAI(base_url=env.vllm_url, api_key="dummy")
-    current_state = replace(SethPresets.DEFAULT)
-    current_state.load(env)  # Load previous state if it exists
-    regulator = SethDynamicRegulator(state=current_state, env=env)
+    tools_manager.register(
+        "generate_image",
+        image_tool.generate_image,
+        (
+            "Use this tool when requested to create, draw, or visualize images. "
+            "ROLE: Creative Art Director. Expand the user request into an English 'Booru-style' tag list. "
+            "RULES: "
+            "1) FORMAT: Strictly short keywords separated by commas (e.g., '1girl, cyberpunk'). NO prose, verbs, or filler words. "
+            "2) CONTEXT CROSS-POLLINATION: Intelligently blend ongoing chat themes into the tags. "
+            "3) CREATIVE RANDOMNESS: If the request is vague, hallucinate artistic details (styles, lighting, atmospheres) to ensure unique, magnificent results. "
+            "OUTPUT PROTOCOL: The tool returns a JSON. You MUST include the exact filepath format 'storage/images/filename.png' in your text response."
+        ),
+        {
+            "type": "object",
+            "properties": {
+                "prompt": {
+                    "type": "string",
+                    "description": (
+                        "Expanded context-aware English prompt in comma-separated tag format. "
+                        "Example: '1girl, floating particles, void atmosphere, dark ambient, baroque, masterwork'"
+                    )
+                }
+            },
+            "required": ["prompt"],
+        },
+    )
 
-    bot_ui = SethTelegramBot(client=client, env=env, tools_manager=tools_manager, regulator=regulator, memory_tool=memory_tool)
+    tools_manager.register(
+        "generate_speech",
+        speech_tool.generate_speech,
+        (
+            "Use this tool ONLY when the user explicitly asks you to speak, read a text aloud, "
+            "or convert a message into a voice note/audio. DO NOT invoke this tool for standard "
+            "text-only responses. The input must be natural, fluid spoken Spanish."
+        ),
+        {
+            "type": "object",
+            "properties": {
+                "text": {
+                    "type": "string",
+                    "description": (
+                        "The exact, clean conversational text to be synthesized into audio. "
+                        "CRITICAL: Must be pure text, sentences, or paragraphs in Spanish. "
+                        "DO NOT include markdown, code blocks, JSON strings, execution logs, or structural syntax."
+                    )
+                }
+            },
+            "required": ["text"],
+        },
+    )
+
+    vllm_client = AsyncOpenAI(base_url=env.vllm_url, api_key=env.api_key)
+    whisper_client = AsyncOpenAI(base_url=env.whisper_url, api_key=env.api_key)
+    current_state = replace(SethStatePresets.DEFAULT)
+    current_state.load(env)
+    regulator = SethDynamicRegulator(state=current_state, env=env)
+    bot_ui = SethTelegramBot(client=vllm_client, env=env, tools_manager=tools_manager, regulator=regulator, memory_tool=memory_tool, whisper_client=whisper_client)
     bot_ui.run()
 
 
