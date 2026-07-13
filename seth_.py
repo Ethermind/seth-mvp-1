@@ -29,6 +29,8 @@ from pydub import AudioSegment
 from kokoro import KPipeline
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.request import HTTPXRequest
+from transformers import AutoTokenizer
 
 load_dotenv()
 
@@ -41,7 +43,7 @@ logging.basicConfig(
 @dataclass(frozen=True)
 class SethEnvironment:
     """Centralized and typed configuration for the SETH ecosystem."""
-    llm_model: str = os.getenv("LLM_MODEL", "nvidia/Gemma-4-26B-A4B-NVFP4")
+    llm_model: str = os.getenv("LLM_MODEL", "abhishekchohan/gemma-4-26B-A4B-it-abliterated-AWQ")
     vllm_url: str = os.getenv("VLLM_URL", "http://localhost:8000/v1")
     whisper_url: str = os.getenv("WHISPER_URL", "http://localhost:8010/v1")
     whisper_model: str = os.getenv("WHISPER_MODEL", "large-v3")
@@ -52,6 +54,7 @@ class SethEnvironment:
     embedding_dims: int = int(os.getenv("EMBEDDING_MODEL_DIMS", 1024))
     system_prompt_path: str = "seth.md"
     log_path: str = "conversation_history.jsonl"
+    log_mem0_path: str = "logs/"
     state_path: str = "seth.state"
     storage_images_dir: str = "storage/images"
     storage_audio_dir: str = "storage/audio"
@@ -64,7 +67,6 @@ class SethEnvironment:
         """Validates critical environment variables."""
         if not self.telegram_token:
             raise ValueError("❌ TELEGRAM_TOKEN is missing in the environment.")
-        logging.info("✅ Environment configuration successfully validated.")
 
 
 class SethSearchTool:
@@ -167,6 +169,17 @@ class Mem0MemoryBuilder:
                     "embedding_model_dims": env.embedding_dims
                 }
             },
+            "memory": {
+                "config": {
+                    "max_memory_items": 1000,
+                    "memory_expiration_days": 45
+                }
+            },
+            "logging": {
+                "config": {
+                    "log_path": env.log_mem0_path
+                }
+            }
         }
         self._memory = None
 
@@ -220,6 +233,7 @@ class SethMemoryTool:
 
         return f"<MEMORY>\n{long_term_context}\n</MEMORY>\n\n"
 
+    #TODO: consider removing this crap. I dont even know why it is still here..
     async def retrieve_very_long_term_memory(self, query: str) -> str:
         def _sync_deep_search():
             mem = Mem0MemorySingleton.get(self.env)
@@ -694,6 +708,7 @@ class SethChatBot:
         self.tools_manager = tools_manager
         self.memory_tool = memory_tool or SethMemoryTool(env)
         self.regulator = regulator
+        self.tokenizer = AutoTokenizer.from_pretrained(self.env.llm_model, trust_remote_code=True)
 
     async def ask(self, messages: list[dict], use_tools: bool = True) -> str:
         tools = self.tools_manager.as_vllm_format() if (use_tools and self.tools_manager) else None
@@ -764,18 +779,9 @@ class SethChatBot:
         if tools:
             kwargs.update(tools=tools, tool_choice="auto")
 
-        # Dynamic context protection
-        total_chars = 0
-        for m in messages:
-            content = m.get("content", "")
-            if isinstance(content, list):
-                for item in content:
-                    if isinstance(item, dict) and item.get("type") == "text":
-                        total_chars += len(item.get("text", ""))
-            else:
-                total_chars += len(str(content))
-        
-        estimated_input_tokens = int((total_chars / 4) * 1.25)
+        formatted_chat = self.tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True)
+        estimated_input_tokens = len(formatted_chat)
+
         max_allowed_context = self.env.max_tokens
         available_output_slots = max_allowed_context - estimated_input_tokens
         requested_output = kwargs.get("max_tokens", 1024)
@@ -783,8 +789,7 @@ class SethChatBot:
         if requested_output > available_output_slots:
             adjusted_output = max(512, available_output_slots - 50)
             logging.warning(
-                f"⚠️ [CONTEXT OVERFLOW GUARD] Prompt denso ({estimated_input_tokens} tks). "
-                f"Recortando max_tokens de {requested_output} a {adjusted_output} para no desbordar vLLM."
+                f"⚠️ [CONTEXT OVERFLOW] ({estimated_input_tokens}, {requested_output}, {adjusted_output})."
             )
             kwargs["max_tokens"] = adjusted_output
 
@@ -1159,14 +1164,17 @@ class SethTelegramBot(SethChatBot):
                 
             except Exception as e:
                 logging.error(f"Error sending chunk {i}: {e}")
-                await update.message.reply_text("⚠️ The response is too long. Here's a part:")
-                await update.message.reply_text(chunk[:3500])
+                await update.message.reply_text(f"⚠️ The response is too long. Here's a part: {chunk[:2500]}...")
 
     def run(self):
-        app = ApplicationBuilder().token(self.env.telegram_token).build()
+        app = (
+            ApplicationBuilder()
+            .token(self.env.telegram_token)
+            .request(HTTPXRequest(connect_timeout=15.0, read_timeout=20.0))
+            .build()
+        )
         app.add_handler(CommandHandler("start", self.start_cmd))
         app.add_handler(MessageHandler((filters.TEXT | filters.PHOTO | filters.VOICE | filters.AUDIO) & ~filters.COMMAND, self.process))
-        logging.info("🚀 SETH Pipeline Up with Persistent Local Storage Matrix.")
         app.run_polling()
 
     
