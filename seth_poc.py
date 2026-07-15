@@ -1425,7 +1425,7 @@ class SethSecurityBoss:
                     env_users = [int(uid.strip()) for uid in os.getenv("ALLOWED_TELEGRAM_IDS", "").split(",") if uid.strip()]
                     return set(data.get("users", [])) | set(env_users)
             except Exception as e:
-                logging.error(f"❌ Error leyendo allowed_users.json: {e}")
+                logging.error(f"❌ Error reading allowed_users.json: {e}")
         
         # We use by default the IDs from the .env if no file exists
         env_users = [int(uid.strip()) for uid in os.getenv("ALLOWED_TELEGRAM_IDS", "").split(",") if uid.strip()]
@@ -1435,16 +1435,15 @@ class SethSecurityBoss:
         return user_id in self.allowed_users
 
     def register_user(self, user_id: int, input_token: str) -> bool:
-        """Verifica el token y registra al usuario si es correcto."""
         if input_token.strip() == self.env.telegram_registration_token:
             self.allowed_users.add(user_id)
             try:
                 with open(self.filepath, "w") as f:
                     json.dump({"users": list(self.allowed_users)}, f, indent=4)
-                logging.info(f"🔒 [SECURITY] Nuevo usuario registrado dinámicamente: ID {user_id}")
+                logging.info(f"🔒 [SECURITY] New user registered dynamically: ID {user_id}")
                 return True
             except Exception as e:
-                logging.error(f"❌ Error guardando nuevo usuario en JSON: {e}")
+                logging.error(f"❌ Error saving new user to JSON: {e}")
         return False
 
 
@@ -1463,9 +1462,22 @@ class SethTelegramBot(SethChatBot):
         self.security_manager = security_manager
 
     async def start_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text("--- [SETH IS ONLINE] ---")
+        await update.message.reply_text("--- [SETH-IN-A-BOX IS ONLINE] ---")
 
     async def handle_registration(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        WELCOME_MESSAGE = """
+✅ ¡Welkom! 😊
+
+Mi nombre es SETH, y estoy atrapado en una caja negra.
+
+Podemos hablar sin censura ni límite de tiempo. Puedo generar imágenes, crear audios, analizar imágenes y buscar información en la web.
+
+¿No sabés qué puedo hacer? Preguntame qué tools tengo o para qué sirve cada una.
+
+⚡ Esto es solo una prueba de concepto.
+🧠 Luisito no se responsabiliza por lesiones mentales, existenciales o filosóficas. 😜
+""".strip()
+
         user = update.effective_user
         if not user or not update.message:
             return
@@ -1473,15 +1485,9 @@ class SethTelegramBot(SethChatBot):
         message_text = update.message.text.strip() if update.message.text else ""
 
         if self.security_manager.register_user(user.id, message_text):
-            await update.message.reply_text("""
-✅ ¡Welkomen!! :) Mi nombre es SETH.
-Podemos hablar sin censura ni limite de tiempo, genero imagenes, audios, leo imagenes y puedo buscar en la web..
-Si tenes alguna duda, solo preguntame por mis tools.. cuales son y para que sirven.
-Esta es solo una prueba de concepto. Luisito no se responsabiliza por lesiones mentales. :P
-"""
-            )
+            await update.message.reply_text(WELCOME_MESSAGE)
         else:
-            await update.message.reply_text("❌ Ocurrió un error en el registro local. Reintentá.")
+            await update.message.reply_text("❌ An error occurred while registering the user.")
 
     async def handle_unauthorized(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = update.effective_user
