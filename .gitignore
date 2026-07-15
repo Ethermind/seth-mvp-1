@@ -4,8 +4,11 @@ __pycache__/
 .continue/
 conversation_history.jsonl
 seth.state
-./storage/
-./models/
-./OLD/
+storage/
+models/
+OLD/
+images/
+neo4j_data/
+neo4j_logs/
 BUG.md
 *.jsonl
