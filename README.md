@@ -102,7 +102,7 @@ Example command to expose a local transcription endpoint:
 faster-whisper-server --port 8010 large-v3
 ```
 
-### Qdrant
+### Qdrant (fix for WSL2)
 
 Example command to run a local Qdrant instance:
 
@@ -133,6 +133,6 @@ The architecture is built from the ground up to favor absolute local latency eff
 * **Embedding Matrix (BGE-Large-En-v1.5 on CUDA:0):** ~2.0 GB VRAM.
 * **Dynamic KV-Cache (FP8 Execution Window - 32k Context):** ~7.5 GB VRAM.
 * **Operational Footprint (vLLM Engine Overhead):** ~0.5 GB VRAM.
-* **Difussion model (SD1.5):** ~3.0 GB VRAM.
+* **Difussion model (Dreamshaper8):** ~3.0 GB VRAM.
 
 ---
