@@ -1,6 +1,6 @@
-# SETH
+# SETH-IN-A-BOX
 
-SETH is a local, multimodal Telegram agent implemented around the main runtime in seth_poc.py. It is intended as a technical prototype for experimenting with local LLM orchestration, tool use, per-user memory, and media generation without depending on external cloud services for the core inference path.
+SETH-IN-A-BOX is a local, multimodal Telegram agent implemented around the main runtime in seth_poc.py. It is intended as a technical prototype for experimenting with local LLM orchestration, tool use, per-user memory, and media generation without depending on external cloud services for the core inference path.
 
 The current implementation supports:
 
@@ -125,7 +125,7 @@ sudo chmod 777 /sys/fs/cgroup/memory.high
 
 ---
 
-## 🏗️ VRAM Budget & Compute Allocation Strategy
+## VRAM Budget & Compute Allocation Strategy
 
 The architecture is built from the ground up to favor absolute local latency efficiency and prefix-cache retention. The physical memory partitioning is strategically budgeted to sustain a massive, non-linear **32k native token context window**:
 
@@ -133,5 +133,6 @@ The architecture is built from the ground up to favor absolute local latency eff
 * **Embedding Matrix (BGE-Large-En-v1.5 on CUDA:0):** ~2.0 GB VRAM.
 * **Dynamic KV-Cache (FP8 Execution Window - 32k Context):** ~7.5 GB VRAM.
 * **Operational Footprint (vLLM Engine Overhead):** ~0.5 GB VRAM.
+* **Difussion model (SD1.5):** ~3.0 GB VRAM.
 
 ---
