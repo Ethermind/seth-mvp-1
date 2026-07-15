@@ -2,42 +2,59 @@
 SETH-IN-A-BOX
 """
 
+from __future__ import annotations
+
 import ast
 import asyncio
 import base64
+from collections import deque
+from contextvars import ContextVar
+from dataclasses import asdict, dataclass, fields, is_dataclass, replace
+from datetime import datetime, timedelta
+import enum
+from functools import lru_cache
+import io
 import inspect
 import json
 import logging
 import os
+from pathlib import Path
 import re
 import time
-from collections import deque
-from contextvars import ContextVar
-from dataclasses import asdict, dataclass, replace
-from datetime import datetime, timedelta
-from typing import Annotated, Any, Dict, Callable, get_args, get_origin, get_type_hints
+from typing import (
+    Annotated,
+    Any,
+    Callable,
+    Dict,
+    Literal,
+    Union,
+    get_args,
+    get_origin,
+    get_type_hints,
+)
+from uuid import UUID
 
-import torch
-import soundfile as sf
-import numpy as np
+import coloredlogs
 from crawl4ai import AsyncWebCrawler, BrowserConfig, CacheMode, CrawlerRunConfig
 from ddgs import DDGS
 from diffusers import DPMSolverMultistepScheduler, StableDiffusionPipeline
 from dotenv import load_dotenv
-import coloredlogs
-from mem0 import Memory
-from openai import AsyncOpenAI
-from sentence_transformers import SentenceTransformer
-from pydub import AudioSegment
 from kokoro import KPipeline
+from mem0 import Memory
+import numpy as np
+from openai import AsyncOpenAI
+from pydantic import BaseModel
+from pydub import AudioSegment
+from sentence_transformers import SentenceTransformer
+import soundfile as sf
 from telegram import Update
 from telegram.error import NetworkError, TimedOut
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
 from telegram.request import HTTPXRequest
+import torch
 from transformers import AutoTokenizer
 
 load_dotenv()
-
 
 @dataclass(frozen=True)
 class SethEnvironment:
@@ -68,6 +85,14 @@ class SethEnvironment:
             raise ValueError("❌ TELEGRAM_TOKEN is missing in the environment.")
         if not self.telegram_registration_token:
             raise ValueError("❌ REGISTRATION_TOKEN is missing in the environment.")
+
+
+@dataclass(slots=True)
+class Tool:
+    name: str
+    func: Callable[..., Any]
+    description: str
+    schema: dict[str, Any]
 
 
 class SethLogger:
@@ -142,70 +167,206 @@ class SethToolsManager:
     Unified engine for LLM Tool discovery, validation, schema generation,
     and safe multi-threaded execution for the SETH ecosystem.
     """
-    
-    _PY_TO_JSON_TYPE = {
-        str: "string",
-        int: "integer",
-        float: "number",
-        bool: "boolean",
-        dict: "object",
-        list: "array"
-    }
 
     def __init__(self):
-        self.tools: Dict[str, Dict[str, Any]] = {}
+        self.tools: Dict[str, Tool] = {}
 
     @staticmethod
-    def tool(description: str):
+    def tool(func: Callable) -> Callable:
         """
-        Marks a method as an LLM-invocable tool and attaches its description.
-        Usage inside tool classes: @SethToolsManager.tool("Description...")
+        Marks a method as an LLM-invocable tool. No description is passed here:
+        the method's own docstring IS the LLM-facing description (via inspect.getdoc).
+        Usage inside tool classes: @SethToolsManager.tool
         """
-        def decorator(func: Callable):
-            func._tool_description = description
-            return func
-        return decorator
+        func.__tool__ = True
+        return func
 
     def _build_schema_from_signature(self, method: Callable) -> dict:
         """
-        Builds a JSON-schema `parameters` block from a method's Annotated type hints.
-        Deliberate design: parameters without Annotated are internal-only.
+        100% IA generated :)
+
+        Builds the JSON-schema `parameters` object from Annotated type hints.
+
+        Parameters not wrapped in Annotated are considered internal and are not
+        exposed to the LLM.
         """
         hints = get_type_hints(method, include_extras=True)
-        properties: dict[str, dict] = {}
-        required: list[str] = []
+
+        properties = {}
+        required = []
 
         for name, param in inspect.signature(method).parameters.items():
-            hint = hints.get(name)
-            if name == "self" or hint is None or get_origin(hint) is not Annotated:
-                continue  # Skip internal or unannotated parameters
+            schema = self._parameter_schema(name, hints)
 
-            args = get_args(hint)
-            base_type = args[0]
-            param_desc = args[1] if len(args) > 1 else ""
+            if schema is None:
+                continue
 
-            properties[name] = {
-                "type": self._PY_TO_JSON_TYPE.get(base_type, "string"),
-                "description": param_desc,
-            }
+            properties[name] = schema
+
             if param.default is inspect.Parameter.empty:
                 required.append(name)
 
-        return {"type": "object", "properties": properties, "required": required}
+        return {
+            "type": "object",
+            "properties": properties,
+            "required": required,
+        }
+
+    def _parameter_schema(self, name: str, hints: dict[str, Any],) -> dict | None:
+        if name == "self":
+            return None
+
+        hint = hints.get(name)
+
+        if hint is None or get_origin(hint) is not Annotated:
+            return None
+
+        base_type, *metadata = get_args(hint)
+
+        schema = self._schema(base_type)
+
+        if metadata:
+            schema["description"] = str(metadata[0])
+
+        return schema
+
+    @lru_cache
+    def _schema(self, tp):
+        origin = get_origin(tp)
+        args = get_args(tp)
+
+        primitives = {
+            str: "string",
+            int: "integer",
+            float: "number",
+            bool: "boolean",
+        }
+
+        if tp in primitives:
+            return {"type": primitives[tp]}
+
+        if tp is Any:
+            return {}
+
+        if tp is UUID:
+            return {"type": "string", "format": "uuid"}
+
+        if tp is Path:
+            return {"type": "string"}
+
+        if tp is datetime.datetime:
+            return {"type": "string", "format": "date-time"}
+
+        if tp is datetime.date:
+            return {"type": "string", "format": "date"}
+
+        if tp is datetime.time:
+            return {"type": "string", "format": "time"}
+
+        if inspect.isclass(tp) and issubclass(tp, enum.Enum):
+            values = [m.value for m in tp]
+
+            if not values:
+                return {"type": "string"}
+
+            schema = self._schema(type(values[0]))
+            schema["enum"] = values
+
+            return schema
+
+        if origin is Literal:
+            values = list(args)
+
+            if not values:
+                return {"type": "string"}
+
+            schema = self._schema(type(values[0]))
+            schema["enum"] = values
+
+            return schema
+
+        if origin is Union:
+            non_none = [a for a in args if a is not type(None)]
+
+            if len(non_none) == 1:
+                schema = self._schema(non_none[0])
+                schema["nullable"] = True
+                return schema
+
+            return {
+                "anyOf": [self._schema(a) for a in non_none]
+            }
+
+        if origin in (list, tuple, set):
+            return {
+                "type": "array",
+                "items": self._schema(args[0] if args else str),
+            }
+
+        if origin is dict:
+            value_type = args[1] if len(args) == 2 else Any
+            return {
+                "type": "object",
+                "additionalProperties": self._schema(value_type),
+            }
+
+        if inspect.isclass(tp) and is_dataclass(tp):
+            hints = get_type_hints(tp)
+            return {
+                "type": "object",
+                "properties": {
+                    f.name: self._schema(hints.get(f.name, Any))
+                    for f in fields(tp)
+                },
+                "required": [
+                    f.name
+                    for f in fields(tp)
+                    if f.default is inspect._empty
+                    and getattr(f, "default_factory", inspect._empty) is inspect._empty
+                ],
+            }
+        if (
+            inspect.isclass(tp)
+            and hasattr(tp, "__annotations__")
+            and hasattr(tp, "__total__")
+        ):
+            hints = get_type_hints(tp)
+            return {
+                "type": "object",
+                "properties": {
+                    k: self._schema(v)
+                    for k, v in hints.items()
+                },
+                "required": list(hints.keys()) if tp.__total__ else [],
+            }
+
+        try:
+            if inspect.isclass(tp) and issubclass(tp, BaseModel):
+                if hasattr(tp, "model_json_schema"):
+                    return tp.model_json_schema()
+
+                return tp.schema()
+
+        except Exception:
+            pass
+
+        return {"type": "string"}
 
     def register_instance(self, instance: Any):
         for name, method in inspect.getmembers(instance, predicate=inspect.ismethod):
-            description = getattr(method.__func__, "_tool_description", None)
-            if description is None:
+            if not getattr(method.__func__, "__tool__", False):
                 continue
-            
+
+            description = inspect.getdoc(method) or ""
+
             schema = self._build_schema_from_signature(method)
             
-            self.tools[name] = {
-                "func": method,
-                "description": description,
-                "parameters": schema
-            }
+            self.tools[name] = Tool(
+                name=name,
+                func=method,
+                description=description,
+                schema=schema
+            )
             logging.info(f"🛠️ [TOOLS MANAGER] Auto-registered tool: '{name}'")
 
     def as_vllm_format(self) -> list:
@@ -213,13 +374,13 @@ class SethToolsManager:
         Returns the standard OpenAI/vLLM format for tool definition lists.
         """
         openai_tools = []
-        for name, meta in self.tools.items():
+        for name, tool in self.tools.items():
             openai_tools.append({
                 "type": "function",
                 "function": {
-                    "name": name,
-                    "description": meta["description"],
-                    "parameters": meta["parameters"]
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": tool.schema
                 }
             })
         return openai_tools
@@ -231,7 +392,7 @@ class SethToolsManager:
         """
         if name not in self.tools:
             raise KeyError(f"Tool '{name}' is not registered in SethToolsManager.")
-        return self.tools[name]["func"]
+        return self.tools[name].func
 
 
 class SethSearchTool:
@@ -240,17 +401,7 @@ class SethSearchTool:
         self.browser_config = BrowserConfig(headless=True, verbose=False)
         self._crawl_semaphore = asyncio.Semaphore(3)
 
-    @SethToolsManager.tool(
-        "EXECUTION RULES FOR LIVE WEB SEARCH: Executes a live internet search to fetch real-time data, "
-        "current events, market conditions, or breaking updates. "
-        "USE CASES: Use this ONLY for public knowledge that requires real-time accuracy, validation of recent news, "
-        "or up-to-date documentation of external frameworks/libraries. "
-        "CASCADE RESOLUTION PROTOCOL: If a query is about public facts or external technical data, and "
-        "your internal knowledge is insufficient OR 'retrieve_long_term_memory' returned empty/outdated results for that specific public fact, "
-        "you MUST invoke this tool. "
-        "CRITICAL RESTRICTION: Do NOT use this tool if the user is asking about local files, private logs, "
-        "personal source code, or internal project states. For local file inspection, use 'inspect_own_source_code' instead."
-    )
+    @SethToolsManager.tool
     async def search(
         self,
         query: Annotated[str, (
@@ -259,7 +410,23 @@ class SethSearchTool:
         )],
         max_results: int = 5,
     ) -> str:
-        """Fetch max_results URLs from DuckDuckGo and crawl them concurrently."""
+        """
+        EXECUTION RULES FOR LIVE WEB SEARCH: Executes a live internet search to fetch real-time data,
+        current events, market conditions, or breaking updates.
+
+        USE CASES: Use this ONLY for public knowledge that requires real-time accuracy, validation of
+        recent news, or up-to-date documentation of external frameworks/libraries.
+
+        CASCADE RESOLUTION PROTOCOL: If a query is about public facts or external technical data, and
+        your internal knowledge is insufficient OR 'retrieve_long_term_memory' returned empty/outdated
+        results for that specific public fact, you MUST invoke this tool.
+
+        CRITICAL RESTRICTION: Do NOT use this tool if the user is asking about local files, private logs,
+        personal source code, or internal project states. For local file inspection, use
+        'inspect_own_source_code' instead.
+
+        Implementation: fetches max_results URLs from DuckDuckGo and crawls them concurrently.
+        """
         try:
             results = await asyncio.to_thread(self._ddgs_with_retries, query, max_results)
 
@@ -411,11 +578,7 @@ class SethMemoryTool:
 
         return f"<MEMORY>\n{long_term_context}\n</MEMORY>\n\n"
 
-    @SethToolsManager.tool(
-        "Persists meaningful facts, technical constraints, decisions, or user preferences into long-term memory. "
-        "Use this tool whenever the user explicitly asks to remember, save, or persist information, "
-        "or when a crucial new fact/correction is introduced in the exchange."
-    )
+    @SethToolsManager.tool
     async def save_long_term_memory(
         self,
         user_input: Annotated[str, (
@@ -429,7 +592,13 @@ class SethMemoryTool:
         )],
         response: Annotated[str, "The assistant's short confirmation or validation of the fact being stored."],
     ) -> Dict[str, Any]:
-        """Persist a memory item to the vector store asynchronously."""
+        """
+        Persists meaningful facts, technical constraints, decisions, or user preferences into
+        long-term memory. Use this tool whenever the user explicitly asks to remember, save, or
+        persist information, or when a crucial new fact/correction is introduced in the exchange.
+
+        Implementation: persists the memory item to the vector store asynchronously.
+        """
         expiration = (datetime.now() + timedelta(days=14)).strftime("%Y-%m-%d")
         user_id = current_user_id.get()
 
@@ -496,15 +665,7 @@ class SethSelfInspectorTool:
             logging.debug("Could not parse AST for structural summary.")
         return result
 
-    @SethToolsManager.tool(
-        "EXECUTION RULES FOR SELF-INSPECTION: Use this tool ALWAYS when the user asks about your source code, "
-        "your internal logic, your Python implementation, or how you are built. "
-        "CRITICAL SYSTEMIC PURPOSES: "
-        "1) SELF-REFERENCE: Read your own script to understand your identity, current class definitions, and active handlers. "
-        "2) CONTEXT DEBUGGING & RECONCILIATION: Invoke this tool immediately if you detect contradictions between your current "
-        "behavior and what the user states about your architecture. Use it to verify your state logic and fix errors. "
-        "TRIGGER KEYWORDS: 'código fuente', 'tu código', 'source code', 'cómo estás programado', 'ver seth.py'."
-    )
+    @SethToolsManager.tool
     def inspect_own_source_code(
             self,
             reason: Annotated[str, (
@@ -518,6 +679,19 @@ class SethSelfInspectorTool:
             include_source: bool = True,
             max_chars: int | None = None
         ) -> str:
+            """
+            EXECUTION RULES FOR SELF-INSPECTION: Use this tool ALWAYS when the user asks about your
+            source code, your internal logic, your Python implementation, or how you are built.
+
+            CRITICAL SYSTEMIC PURPOSES:
+            1) SELF-REFERENCE: Read your own script to understand your identity, current class
+               definitions, and active handlers.
+            2) CONTEXT DEBUGGING & RECONCILIATION: Invoke this tool immediately if you detect
+               contradictions between your current behavior and what the user states about your
+               architecture. Use it to verify your state logic and fix errors.
+
+            TRIGGER KEYWORDS: 'código fuente', 'tu código', 'source code', 'cómo estás programado', 'ver seth.py'.
+            """
             logging.info(f"🔍 [SETH SELF-INSPECTION TRIGGERED] Reason: '{reason}'")
 
             path = self.main_script_path
@@ -617,15 +791,7 @@ class SethImageGenerationTool:
             logging.error(f"❌ Image generation error on GPU {self.device}: {e}")
             raise e
 
-    @SethToolsManager.tool(
-        "Use this tool when requested to create, draw, or visualize images. "
-        "ROLE: Creative Art Director. Expand the user request into an English 'Booru-style' tag list. "
-        "RULES: "
-        "1) FORMAT: Strictly short keywords separated by commas (e.g., '1girl, cyberpunk'). NO prose, verbs, or filler words. "
-        "2) CONTEXT CROSS-POLLINATION: Intelligently blend ongoing chat themes into the tags. "
-        "3) CREATIVE RANDOMNESS: If the request is vague, hallucinate artistic details (styles, lighting, atmospheres) to ensure unique, magnificent results. "
-        "OUTPUT PROTOCOL: The tool returns a JSON. You MUST include the exact filepath format 'storage/images/filename.png' in your text response."
-    )
+    @SethToolsManager.tool
     async def generate_image(
         self,
         prompt: Annotated[str, (
@@ -633,6 +799,21 @@ class SethImageGenerationTool:
             "Example: '1girl, floating particles, void atmosphere, dark ambient, baroque, masterwork'"
         )],
     ) -> str:
+        """
+        Use this tool when requested to create, draw, or visualize images.
+
+        ROLE: Creative Art Director. Expand the user request into an English 'Booru-style' tag list.
+
+        RULES:
+        1) FORMAT: Strictly short keywords separated by commas (e.g., '1girl, cyberpunk'). NO prose,
+           verbs, or filler words.
+        2) CONTEXT CROSS-POLLINATION: Intelligently blend ongoing chat themes into the tags.
+        3) CREATIVE RANDOMNESS: If the request is vague, hallucinate artistic details (styles,
+           lighting, atmospheres) to ensure unique, magnificent results.
+
+        OUTPUT PROTOCOL: The tool returns a JSON. You MUST include the exact filepath format
+        'storage/images/filename.png' in your text response.
+        """
         logging.info(f"🖼️ Received image generation request with prompt: '{prompt}'")
         async with self._lock:
             if self._cleanup_task and not self._cleanup_task.done():
@@ -711,11 +892,7 @@ class SethSpeechGenerationTool:
         if os.path.exists(wav_path):
             os.remove(wav_path)
 
-    @SethToolsManager.tool(
-        "Use this tool ONLY when the user explicitly asks you to speak, read a text aloud, "
-        "or convert a message into a voice note/audio. DO NOT invoke this tool for standard "
-        "text-only responses. The input must be natural, fluid spoken Spanish."
-    )
+    @SethToolsManager.tool
     async def generate_speech(
         self,
         text: Annotated[str, (
@@ -724,6 +901,11 @@ class SethSpeechGenerationTool:
             "DO NOT include markdown, code blocks, JSON strings, execution logs, or structural syntax."
         )],
     ) -> str:
+        """
+        Use this tool ONLY when the user explicitly asks you to speak, read a text aloud,
+        or convert a message into a voice note/audio. DO NOT invoke this tool for standard
+        text-only responses. The input must be natural, fluid spoken Spanish.
+        """
         logging.info(f"🎙️ [KOKORO TTS] Petición de audio recibida para: '{text[:40]}...'")
         async with self._lock:
             try:
@@ -943,27 +1125,12 @@ class SethChatBot:
 
         response = await self._llm_call(local_messages, tools, config)
 
-        logging.info(
-            "🧠 vLLM Response:\n%s",
-            response.model_dump_json(indent=2)
-        )
-
         message = response.choices[0].message
         local_messages.append(self._serialize_completion_message(message))
 
         if getattr(message, 'tool_calls', None):
             local_messages = await self._execute_tool_calls(message.tool_calls, local_messages)
-            logging.info(
-                "🧠 Feeding tool results back to the LLM for final synthesis...\n%s",
-                self._dump_messages_for_logging(local_messages)
-            )
-
             final_response = await self._llm_call(local_messages, tools, config)
-
-            logging.info(
-                "🧠 vLLM Response after tool calls:\n%s",
-                final_response.model_dump_json(indent=2)
-            )
             return final_response.choices[0].message.content
 
         return message.content
@@ -1306,11 +1473,12 @@ class SethTelegramBot(SethChatBot):
         message_text = update.message.text.strip() if update.message.text else ""
 
         if self.security_manager.register_user(user.id, message_text):
-            await update.message.reply_text(
-                "✅ ¡Welkomen!! :) Mi nombre es SETH.\n"
-                "Podemos hablar sin censura, genero imagenes, audios, leo imagenes y puedo buscar en la web..\n"
-                "Si tenes alguna duda, solo preguntame por mis tools.. cuales son y para que sirven.\n"
-                "Esta es solo una prueba de concepto. Luisito no se responsabiliza por lesiones mentales.\n"
+            await update.message.reply_text("""
+✅ ¡Welkomen!! :) Mi nombre es SETH.
+Podemos hablar sin censura ni limite de tiempo, genero imagenes, audios, leo imagenes y puedo buscar en la web..
+Si tenes alguna duda, solo preguntame por mis tools.. cuales son y para que sirven.
+Esta es solo una prueba de concepto. Luisito no se responsabiliza por lesiones mentales. :P
+"""
             )
         else:
             await update.message.reply_text("❌ Ocurrió un error en el registro local. Reintentá.")
@@ -1322,9 +1490,7 @@ class SethTelegramBot(SethChatBot):
 
         logging.warning(f"🚨 [UNAUTHORIZED ACCESS] ID: {user.id} - @{user.username if user.username else 'NoUsername'}")
         await update.message.reply_text(
-            "⛔ **Acceso Restringido**\n\n"
-            "No tenés permisos para despertar los tensores de SETH.\n"
-            "Si sos un usuario invitado, por favor enviá el **Token de Activación**."
+            "⛔ **Restricted Access**"
         )
 
     async def error_handler(self, update, context):
@@ -1361,67 +1527,56 @@ class SethTelegramBot(SethChatBot):
             current_user_id.reset(user_ctx_token)
 
     async def _process_for_user(self, update: Update, context: ContextTypes.DEFAULT_TYPE, telegram_user_id: str):
-        user_text = update.message.text or update.message.caption or ""
-        base64_image = None
+        stop_event = asyncio.Event()
+        action_type = "record_voice" if (update.message.voice or update.message.audio) else "typing"
+        keep_alive_task = asyncio.create_task(
+            self._keep_alive_chat_action(context.bot, update.effective_chat.id, action_type, stop_event)
+        )
 
-        # Audio
-        if update.message.voice or update.message.audio:
-            transcribed_text = await self._handle_voice_message(update, context)
-            if not transcribed_text:
-                return
-            user_text = transcribed_text
-
-        # Images
-        elif update.message.photo:
-            base64_image, user_text = await self._handle_photo_message(update, context, user_text)
-            if not base64_image:
-                return
-
-        if not user_text and not base64_image:
-            await update.message.reply_text("⚠️ Unsupported format.")
-            return
-
-        if base64_image:
-            user_content = [
-                {"type": "text", "text": user_text},
-                {
-                    "type": "image_url",
-                    "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}
-                }
-            ]
-        else:
-            user_content = user_text
-
-        # Memory (scoped to this Telegram user)
-        history = await self.short_memory.get_history_messages(telegram_user_id)
-        messages = [{"role": "system", "content": self.system_prompt}] + \
-                   history + \
-                   [{"role": "user", "content": user_content}]
-
-        # Inference
-        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
         try:
-            response = await self.ask(messages, use_tools=True)
- 
-            match_image = re.search(r"(?:storage/)?images/[\w\-_]+\.png", response)
-            if match_image:
-                detected_path = match_image.group(0)
-                if os.path.exists(detected_path):
-                    logging.info(f"📸 Detected image path in response: {detected_path}. Sending photo to Telegram.")
-                    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="upload_photo")
-                    with open(detected_path, "rb") as photo:
-                        await update.message.reply_photo(photo=photo)
+            user_text = update.message.text or update.message.caption or ""
+            base64_image = None
+
+            # Audio
+            if update.message.voice or update.message.audio:
+                transcribed_text = await self._handle_voice_message(update, context)
+                if not transcribed_text:
+                    return
+                user_text = transcribed_text
+
+            # Images
+            elif update.message.photo:
+                base64_image, user_text = await self._handle_photo_message(update, context, user_text)
+                if not base64_image:
                     return
 
-            match_audio = re.search(r"(?:storage/)?audio/([\w\-_]+\.mp3)", response)
-            if match_audio:
-                detected_audio_path = match_audio.group(0)
-                if os.path.exists(detected_audio_path):
-                    logging.info(f"📁 Detected audio path in response: {detected_audio_path}. Transmitting voice note.")
-                    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="record_voice")
-                    with open(detected_audio_path, "rb") as audio_file:
-                        await update.message.reply_voice(voice=audio_file)
-                    return
+            if not user_text and not base64_image:
+                await update.message.reply_text("⚠️ Unsupported format.")
+                return
+
+            if base64_image:
+                user_content = [
+                    {"type": "text", "text": user_text},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}
+                    }
+                ]
+            else:
+                user_content = user_text
+
+            # Memory (scoped to this Telegram user)
+            history = await self.short_memory.get_history_messages(telegram_user_id)
+            messages = [{"role": "system", "content": self.system_prompt}] + \
+                    history + \
+                    [{"role": "user", "content": user_content}]
+
+            # Inference
+            await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+            response = await self.ask(messages, use_tools=True)
+
+            if await self._send_media_if_present(update, context, response):
+                return
 
             self.short_memory.append(telegram_user_id, user_text, response)
 
@@ -1429,13 +1584,18 @@ class SethTelegramBot(SethChatBot):
         except Exception as e:
             logging.exception(f"❌ Internal inference error: {str(e)}")
             await update.message.reply_text("❌ Error with vision processing.")
-                        
+        finally:
+            stop_event.set()
+            keep_alive_task.cancel()
+            try:
+                await keep_alive_task
+            except asyncio.CancelledError:
+                pass
 
     async def _handle_voice_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> str | None:
         await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="record_voice")
         try:
             os.makedirs(self.env.storage_audio_dir, exist_ok=True)
-
             audio_obj = update.message.voice if update.message.voice else update.message.audio
             audio_file = await context.bot.get_file(audio_obj.file_id)
             
@@ -1449,29 +1609,48 @@ class SethTelegramBot(SethChatBot):
             await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
             if not self.whisper_client:
-                raise ValueError("Whisper client is not initialized in the pipeline.")
+                raise ValueError("Whisper client is not initialized.")
 
-            def _read_audio():
-                with open(local_path, "rb") as f:
-                    return f.read()
-
-            audio_bytes = await asyncio.get_running_loop().run_in_executor(None, _read_audio)
+            chunks = self._split_audio_if_needed(local_path, max_duration_sec=60)
             
-            audio_tag = f"[Audio: {local_path}]"
+            async def _transcribe_chunk(index: int, chunk_path: str) -> tuple[int, str, str]:
+                def _read_audio(path):
+                    with open(path, "rb") as f:
+                        return f.read()
 
-            transcription = await self.whisper_client.audio.transcriptions.create(
-                model=self.env.whisper_model,
-                file=(os.path.basename(local_path), audio_bytes)
-            )
+                audio_bytes = await asyncio.get_running_loop().run_in_executor(None, _read_audio, chunk_path)
+                audio_buffer = io.BytesIO(audio_bytes)
+                audio_buffer.name = os.path.basename(chunk_path)
+                
+                logging.info(f"⚡ Starting parallel transcription for chunk {index}: {audio_buffer.name}")
+                transcription = await self.whisper_client.audio.transcriptions.create(
+                    model=self.env.whisper_model,
+                    file=audio_buffer
+                )
+                return index, transcription.text.strip(), chunk_path
+
+            tasks = [_transcribe_chunk(idx, path) for idx, path in enumerate(chunks)]
+            results = await asyncio.gather(*tasks)
+            results.sort(key=lambda x: x[0])
             
-            transcribed_text = transcription.text.strip()
+            transcriptions = []
+            for _, text, chunk_path in results:
+                if text:
+                    transcriptions.append(text)
+                if chunk_path != local_path and os.path.exists(chunk_path):
+                    try:
+                        os.remove(chunk_path)
+                    except Exception as e:
+                        logging.warning(f"⚠️ Cannot remove temporary chunk {chunk_path}: {e}")
+
+            transcribed_text = " ".join(transcriptions).strip()
             logging.info(f"🎙️ [WHISPER TRANSCRIPTION]: '{transcribed_text}'")
 
             if not transcribed_text:
                 await update.message.reply_text("🔇 Cannot understand the audio.")
                 return None
 
-            return f"{audio_tag} - {transcribed_text}"
+            return f"[Audio: {local_path}] - {transcribed_text}"
 
         except Exception as e:
             logging.error(f"🎙️ Error processing audio sub-system: {e}")
@@ -1514,6 +1693,30 @@ class SethTelegramBot(SethChatBot):
             logging.error(f"📸 Error processing Vision from Telegram: {e}")
             await update.message.reply_text("❌ Cannot process or store the visual file you sent.")
             return None, user_text
+
+    async def _send_media_if_present(self, update: Update, context: ContextTypes.DEFAULT_TYPE, response: str) -> bool:
+        """Sends a locally generated image or audio attachment if the response includes a media path."""
+        image_match = re.search(r"(?:storage/)?images/[\w\-_]+\.png", response)
+        if image_match:
+            detected_path = image_match.group(0)
+            if os.path.exists(detected_path):
+                logging.info(f"📸 Detected image path in response: {detected_path}. Sending photo to Telegram.")
+                await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="upload_photo")
+                with open(detected_path, "rb") as photo:
+                    await update.message.reply_photo(photo=photo)
+                return True
+
+        audio_match = re.search(r"(?:storage/)?audio/([\w\-_]+\.mp3)", response)
+        if audio_match:
+            detected_audio_path = audio_match.group(0)
+            if os.path.exists(detected_audio_path):
+                logging.info(f"📁 Sending voice response: {detected_audio_path}")
+                await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="record_voice")
+                with open(detected_audio_path, "rb") as audio_file:
+                    await update.message.reply_voice(voice=audio_file)
+                return True
+
+        return False
 
     async def _send_long_message(self, update: Update, text: str, max_length: int = 4096):
         """Sends long messages by splitting them automatically while safely keeping Markdown code blocks intact."""
@@ -1570,6 +1773,37 @@ class SethTelegramBot(SethChatBot):
                 logging.error(f"Error sending chunk {i}: {e}")
                 await update.message.reply_text(f"⚠️ The response is too long. Here's a part: {chunk[:2500]}...")
 
+    async def _keep_alive_chat_action(self, bot, chat_id: int, action: str, stop_event: asyncio.Event):
+        while not stop_event.is_set():
+            try:
+                await bot.send_chat_action(chat_id=chat_id, action=action)
+            except Exception as e:
+                logging.debug(f"⚠️ Keep-alive action failed: {e}")
+            await asyncio.sleep(4.0)
+
+    def _split_audio_if_needed(self, local_path: str, max_duration_sec: int = 60) -> list[str]:
+        try:
+            audio = AudioSegment.from_file(local_path)
+            duration_sec = len(audio) / 1000.0
+            
+            if duration_sec <= max_duration_sec:
+                return [local_path]
+            
+            logging.info(f"🔪 The audio of {duration_sec:.1f}s exceeds the limit of {max_duration_sec}s. Splitting...")
+            chunks = []
+            ext = os.path.splitext(local_path)[1][1:]
+            
+            for i in range(0, len(audio), max_duration_sec * 1000):
+                chunk = audio[i:i + max_duration_sec * 1000]
+                chunk_path = f"{local_path}_part{i}.{ext}"
+                chunk.export(chunk_path, format=ext)
+                chunks.append(chunk_path)
+                
+            return chunks
+        except Exception as e:
+            logging.warning(f"⚠️ Cannot split the audio ({e}). Processing original file.")
+            return [local_path]
+        
     def run(self):
         class AuthorizedUserFilter(filters.MessageFilter):
             def __init__(self, security_manager):

@@ -3,3 +3,6 @@ __pycache__/
 .vscode/
 conversation_history.jsonl
 seth.state
+./storage/
+seth.py
+seth_.py
