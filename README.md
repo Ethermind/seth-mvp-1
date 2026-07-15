@@ -102,7 +102,7 @@ Example command to expose a local transcription endpoint:
 faster-whisper-server --port 8010 large-v3
 ```
 
-### Qdrant (fix for WSL2)
+### Qdrant (with fix for my WSL2)
 
 Example command to run a local Qdrant instance:
 
