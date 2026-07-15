@@ -2,13 +2,13 @@
 __pycache__/
 .vscode/
 .continue/
-conversation_history.jsonl
 seth.state
 storage/
 models/
 OLD/
 images/
+.pytest_cache/
+conversations/
 neo4j_data/
 neo4j_logs/
 BUG.md
-*.jsonl
