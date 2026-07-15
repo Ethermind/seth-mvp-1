@@ -1,8 +1,11 @@
 .env
 __pycache__/
 .vscode/
+.continue/
 conversation_history.jsonl
 seth.state
 ./storage/
-seth.py
-seth_.py
+./models/
+./OLD/
+BUG.md
+*.jsonl

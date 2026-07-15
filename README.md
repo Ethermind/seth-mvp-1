@@ -134,5 +134,6 @@ The architecture is built from the ground up to favor absolute local latency eff
 * **Dynamic KV-Cache (FP8 Execution Window - 32k Context):** ~7.5 GB VRAM.
 * **Operational Footprint (vLLM Engine Overhead):** ~0.5 GB VRAM.
 * **Difussion model (Dreamshaper8):** ~3.0 GB VRAM.
+* **Voice Generation (Kokoro):** CPU!
 
 ---
