@@ -402,7 +402,7 @@ class SethSearchTool:
         self._crawl_semaphore = asyncio.Semaphore(3)
 
     @SethToolsManager.tool
-    async def search(
+    async def web_search(
         self,
         query: Annotated[str, (
             "The precise, sanitized search query. Use targeted keywords (e.g., 'fastapi lifespan syntax'). "

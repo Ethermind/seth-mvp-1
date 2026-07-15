@@ -129,10 +129,9 @@ sudo chmod 777 /sys/fs/cgroup/memory.high
 
 The architecture is built from the ground up to favor absolute local latency efficiency and prefix-cache retention. The physical memory partitioning is strategically budgeted to sustain a massive, non-linear **32k native token context window**:
 
-* **LLM Core Engine (Gemma-4 26B - FP4 Quantized):** ~14.5 GB VRAM.
+* **LLM Core Engine (Gemma-4 26B - FP4 Quantized):** ~17.5 GB VRAM.
 * **Embedding Matrix (BGE-Large-En-v1.5 on CUDA:0):** ~2.0 GB VRAM.
 * **Dynamic KV-Cache (FP8 Execution Window - 32k Context):** ~7.5 GB VRAM.
-* **Operational Footprint (vLLM Engine Overhead):** ~0.5 GB VRAM.
 * **Difussion model (Dreamshaper8):** ~3.0 GB VRAM.
 * **Voice Generation (Kokoro):** CPU!
 
