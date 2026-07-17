@@ -1827,7 +1827,7 @@ Podemos hablar sin censura ni límite de tiempo. Puedo generar imágenes, crear 
                 
             return chunks
         except Exception as e:
-            logging.warning(f"⚠️ Cannot split the audio ({e}). Processing original file.")
+            logging.warning(f"⚠️ Cannot split the audio ({e}).")
             return [local_path]
         
     def run(self):
