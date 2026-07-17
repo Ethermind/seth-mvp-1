@@ -95,7 +95,7 @@ class Tool:
     schema: dict[str, Any]
 
 
-class SethLogger:
+class SethLoggerInit:
     """Centralized logging configuration for the SETH ecosystem."""
     def __init__(self):
         self.prepare_coloredlogs()
@@ -151,7 +151,6 @@ class SethLogger:
         run_file_handler.setLevel(logging.INFO)
         logging.getLogger().addHandler(run_file_handler)
 
-seth_logger = SethLogger()
 
 # Carries the identity of whoever is talking to Seth right now. Set once per
 # Telegram update in SethTelegramBot.process(), read by memory/RAG tools.
@@ -1499,7 +1498,7 @@ Podemos hablar sin censura ni límite de tiempo. Puedo generar imágenes, crear 
             "⛔ **Restricted Access**"
         )
 
-    async def error_handler(self, update, context):
+    async def error_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         err = context.error
 
         if isinstance(err, NetworkError):
@@ -1863,6 +1862,7 @@ Podemos hablar sin censura ni límite de tiempo. Puedo generar imágenes, crear 
 
 
 def main():
+    SethLoggerInit()
     env = SethEnvironment()
     env.validate()
 
