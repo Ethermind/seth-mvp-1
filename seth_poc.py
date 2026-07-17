@@ -1125,7 +1125,7 @@ class SethChatBot:
                 self._dump_messages_for_logging(local_messages)
             )
 
-            response = await self._llm_call(local_messages, tools, config)
+            response = await self._llm_call(local_messages, tools=tools, config=config)
             message = response.choices[0].message
             local_messages.append(self._serialize_completion_message(message))
 
@@ -1200,9 +1200,7 @@ class SethChatBot:
 
         if requested_output > available_output_slots:
             adjusted_output = available_output_slots - 50
-            logging.warning(
-                f"⚠️ [CONTEXT OVERFLOW] ({estimated_input_tokens}, {requested_output}, {adjusted_output})."
-            )
+            logging.warning(f"⚠️ [CONTEXT OVERFLOW] ({estimated_input_tokens}, {requested_output}, {adjusted_output}).")
             kwargs["max_tokens"] = adjusted_output
 
         return await self.client.chat.completions.create(**kwargs)
@@ -1318,7 +1316,6 @@ class SethShortMemory:
                 logging.error(f"❌ Error reading system prompt: {e}")
         return "\n***REQUEST THE USER TO PROVIDE A VALID SYSTEM PROMPT!***\n"
 
-
     def _safe_user_fragment(self, user_id: str) -> str:
         """Sanitizes a user id for safe use as a filename fragment."""
         return re.sub(r"[^A-Za-z0-9_\-]", "_", str(user_id)) or "unknown"
@@ -1426,6 +1423,7 @@ class SethSecurityBoss:
         self.filepath = "storage/allowed_users.json"
         self._ensure_storage_exists()
         self.allowed_users = self._load_users()
+        self.admin = self.allowed_users[0] if self.allowed_users else None
 
     def _ensure_storage_exists(self):
         os.makedirs(os.path.dirname(self.filepath), exist_ok=True)
@@ -1496,7 +1494,6 @@ Podemos hablar sin censura ni límite de tiempo. Puedo generar imágenes, crear 
 ¿No sabés qué puedo hacer? Preguntame qué tools tengo o para qué sirve cada una.
 
 ⚡ Esto es solo una prueba de concepto.
-🧠 Luisito no se responsabiliza por lesiones mentales, existenciales o filosóficas. 😜
 """.strip()
 
         user = update.effective_user
