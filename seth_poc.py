@@ -1423,6 +1423,8 @@ class SethSecurityBoss:
         self.filepath = "storage/allowed_users.json"
         self._ensure_storage_exists()
         self.allowed_users = self._load_users()
+        # first user in the list is considered the admin, if any
+        # TODO: use in the future to allow admin-only commands, like resetting the allowed_users.json
         self.admin = list(self.allowed_users)[0] if self.allowed_users else None
 
     def _ensure_storage_exists(self):
