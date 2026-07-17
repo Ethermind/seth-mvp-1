@@ -76,6 +76,8 @@ The bot reads configuration from environment variables and defaults where approp
 - QDRANT_PORT
 - API_KEY
 
+You can check default values in .env.example file.
+
 ## Running the bot
 
 Install the required dependencies, then start the bot with:
