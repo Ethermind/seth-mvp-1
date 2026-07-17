@@ -727,7 +727,6 @@ class SethSelfInspectorTool:
             report["error"] = str(e)
             return json.dumps(report, ensure_ascii=False)
 
-
 class SethImageGenerationTool:
     """Image generation tool optimized for using the secondary GPU."""
     def __init__(self, env: SethEnvironment):
@@ -862,7 +861,7 @@ class SethSpeechGenerationTool:
         self.lang_code = "e" 
         self._pipeline = None
         self._lock = asyncio.Lock()
-        logging.info("🔊 [SPEECH SYSTEM INIT] Kokoro initialized for Spanish.")
+        logging.info(f"🔊 [SPEECH SYSTEM INIT] Kokoro initialized for Spanish.")
 
     def _init_tts(self):
         if self._pipeline is None:
@@ -1111,7 +1110,11 @@ class SethChatBot:
 
         return "\n".join(out)
 
-    async def ask(self, messages: list[dict], use_tools: bool = True) -> str:
+    async def ask(self, messages: list[dict], use_tools: bool = True, max_tool_hops: int = 5) -> str:
+        """
+        Runs the chat + tool-calling loop until the model answers with plain
+        text or `max_tool_hops` tool-call rounds are exhausted.
+        """
         tools = self.tools_manager.as_vllm_format() if (use_tools and self.tools_manager) else None
         local_messages = list(messages)
 
@@ -1119,22 +1122,25 @@ class SethChatBot:
         local_messages = await self._inject_memory_context(local_messages, pure_text_query)
         config = await self._resolve_inference_config(pure_text_query)
 
-        logging.info(
-            "🧠 Calling vLLM.\n%s",
-            self._dump_messages_for_logging(local_messages)
-        )
+        for hop in range(max_tool_hops):
+            logging.info(
+                f"🧠 Calling vLLM (tool hop {hop + 1}/{max_tool_hops}).\n%s",
+                self._dump_messages_for_logging(local_messages)
+            )
 
-        response = await self._llm_call(local_messages, tools, config)
+            response = await self._llm_call(local_messages, tools, config)
+            message = response.choices[0].message
+            local_messages.append(self._serialize_completion_message(message))
 
-        message = response.choices[0].message
-        local_messages.append(self._serialize_completion_message(message))
+            if not getattr(message, 'tool_calls', None):
+                return message.content or ""
 
-        if getattr(message, 'tool_calls', None):
+            logging.info(f"🛠️ [TOOL HOP {hop + 1}] Model requested {len(message.tool_calls)} tool call(s).")
             local_messages = await self._execute_tool_calls(message.tool_calls, local_messages)
-            final_response = await self._llm_call(local_messages, tools, config)
-            return final_response.choices[0].message.content
 
-        return message.content
+        logging.warning(f"⚠️ [TOOL HOP LIMIT] Reached {max_tool_hops} tool hops.")
+        final_response = await self._llm_call(local_messages, tools=None, config=config)
+        return final_response.choices[0].message.content or "❌ Error: Tool hop limit reached."
 
     def _extract_text_query(self, messages: list[dict]) -> str:
         """Extract the plain text from the last message, whether it's a string or a multimodal list."""
