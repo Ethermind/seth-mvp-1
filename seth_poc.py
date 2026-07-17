@@ -9,8 +9,9 @@ import asyncio
 import base64
 from collections import deque
 from contextvars import ContextVar
-from dataclasses import asdict, dataclass, fields, is_dataclass, replace
+from dataclasses import asdict, dataclass, fields, is_dataclass, replace, MISSING
 from datetime import datetime, timedelta
+from datetime import date as _dt_date, time as _dt_time
 import enum
 from functools import lru_cache
 import io
@@ -229,8 +230,9 @@ class SethToolsManager:
 
         return schema
 
+    @staticmethod
     @lru_cache
-    def _schema(self, tp):
+    def _schema(tp):
         origin = get_origin(tp)
         args = get_args(tp)
 
@@ -253,13 +255,13 @@ class SethToolsManager:
         if tp is Path:
             return {"type": "string"}
 
-        if tp is datetime.datetime:
+        if tp is datetime:
             return {"type": "string", "format": "date-time"}
 
-        if tp is datetime.date:
+        if tp is _dt_date:
             return {"type": "string", "format": "date"}
 
-        if tp is datetime.time:
+        if tp is _dt_time:
             return {"type": "string", "format": "time"}
 
         if inspect.isclass(tp) and issubclass(tp, enum.Enum):
@@ -268,7 +270,7 @@ class SethToolsManager:
             if not values:
                 return {"type": "string"}
 
-            schema = self._schema(type(values[0]))
+            schema = dict(SethToolsManager._schema(type(values[0])))
             schema["enum"] = values
 
             return schema
@@ -279,7 +281,7 @@ class SethToolsManager:
             if not values:
                 return {"type": "string"}
 
-            schema = self._schema(type(values[0]))
+            schema = dict(SethToolsManager._schema(type(values[0])))
             schema["enum"] = values
 
             return schema
@@ -288,25 +290,25 @@ class SethToolsManager:
             non_none = [a for a in args if a is not type(None)]
 
             if len(non_none) == 1:
-                schema = self._schema(non_none[0])
+                schema = dict(SethToolsManager._schema(non_none[0]))
                 schema["nullable"] = True
                 return schema
 
             return {
-                "anyOf": [self._schema(a) for a in non_none]
+                "anyOf": [SethToolsManager._schema(a) for a in non_none]
             }
 
         if origin in (list, tuple, set):
             return {
                 "type": "array",
-                "items": self._schema(args[0] if args else str),
+                "items": SethToolsManager._schema(args[0] if args else str),
             }
 
         if origin is dict:
             value_type = args[1] if len(args) == 2 else Any
             return {
                 "type": "object",
-                "additionalProperties": self._schema(value_type),
+                "additionalProperties": SethToolsManager._schema(value_type),
             }
 
         if inspect.isclass(tp) and is_dataclass(tp):
@@ -314,14 +316,13 @@ class SethToolsManager:
             return {
                 "type": "object",
                 "properties": {
-                    f.name: self._schema(hints.get(f.name, Any))
+                    f.name: SethToolsManager._schema(hints.get(f.name, Any))
                     for f in fields(tp)
                 },
                 "required": [
                     f.name
                     for f in fields(tp)
-                    if f.default is inspect._empty
-                    and getattr(f, "default_factory", inspect._empty) is inspect._empty
+                    if f.default is MISSING and f.default_factory is MISSING
                 ],
             }
         if (
@@ -333,7 +334,7 @@ class SethToolsManager:
             return {
                 "type": "object",
                 "properties": {
-                    k: self._schema(v)
+                    k: SethToolsManager._schema(v)
                     for k, v in hints.items()
                 },
                 "required": list(hints.keys()) if tp.__total__ else [],
@@ -665,7 +666,7 @@ class SethSelfInspectorTool:
         return result
 
     @SethToolsManager.tool
-    def inspect_own_source_code(
+    async def inspect_own_source_code(
             self,
             reason: Annotated[str, (
                 "A brief, programmatic reason explaining why self-inspection is required "
@@ -691,37 +692,40 @@ class SethSelfInspectorTool:
 
             TRIGGER KEYWORDS: 'código fuente', 'tu código', 'source code', 'cómo estás programado', 'ver seth.py'.
             """
-            logging.info(f"🔍 [SETH SELF-INSPECTION TRIGGERED] Reason: '{reason}'")
+            return await asyncio.to_thread(self._inspect_sync, reason, include_source, max_chars)
 
-            path = self.main_script_path
-            if max_chars is None:
-                max_chars = self.max_chars
+    def _inspect_sync(self, reason: str, include_source: bool, max_chars: int | None) -> str:
+        logging.info(f"🔍 [SETH SELF-INSPECTION TRIGGERED] Reason: '{reason}'")
 
-            report: Dict[str, Any] = {"path": path, "exists": False, "inspection_reason": reason}
-            try:
-                if not os.path.exists(path):
-                    report["error"] = f"Main script not found at {path}"
-                    return json.dumps(report, ensure_ascii=False)
+        path = self.main_script_path
+        if max_chars is None:
+            max_chars = self.max_chars
 
-                stat = os.stat(path)
-                report.update({
-                    "exists": True,
-                    "size_bytes": stat.st_size,
-                    "modified": datetime.fromtimestamp(stat.st_mtime).isoformat(),
-                })
-
-                source = self._safe_read(path, int(max_chars)) if include_source else ""
-                summary = self._structural_summary(source if source else "")
-
-                report.update({"summary": {"functions": summary["functions"], "classes": summary["classes"], "imports": summary["imports"]}})
-                if include_source:
-                    report["source_preview"] = source
-
+        report: Dict[str, Any] = {"path": path, "exists": False, "inspection_reason": reason}
+        try:
+            if not os.path.exists(path):
+                report["error"] = f"Main script not found at {path}"
                 return json.dumps(report, ensure_ascii=False)
-            except Exception as e:
-                logging.exception("SethSelfInspectorTool failure: %s", e)
-                report["error"] = str(e)
-                return json.dumps(report, ensure_ascii=False)
+
+            stat = os.stat(path)
+            report.update({
+                "exists": True,
+                "size_bytes": stat.st_size,
+                "modified": datetime.fromtimestamp(stat.st_mtime).isoformat(),
+            })
+
+            source = self._safe_read(path, int(max_chars)) if include_source else ""
+            summary = self._structural_summary(source if source else "")
+
+            report.update({"summary": {"functions": summary["functions"], "classes": summary["classes"], "imports": summary["imports"]}})
+            if include_source:
+                report["source_preview"] = source
+
+            return json.dumps(report, ensure_ascii=False)
+        except Exception as e:
+            logging.exception("SethSelfInspectorTool failure: %s", e)
+            report["error"] = str(e)
+            return json.dumps(report, ensure_ascii=False)
 
 
 class SethImageGenerationTool:
@@ -1180,7 +1184,9 @@ class SethChatBot:
         if tools:
             kwargs.update(tools=tools, tool_choice="auto")
 
-        formatted_chat = self.tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True)
+        formatted_chat = self.tokenizer.apply_chat_template(
+            messages, tools=tools, tokenize=True, add_generation_prompt=True
+        )
         estimated_input_tokens = len(formatted_chat)
 
         max_allowed_context = self.env.max_tokens
