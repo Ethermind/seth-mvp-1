@@ -1423,7 +1423,7 @@ class SethSecurityBoss:
         self.filepath = "storage/allowed_users.json"
         self._ensure_storage_exists()
         self.allowed_users = self._load_users()
-        self.admin = self.allowed_users[0] if self.allowed_users else None
+        self.admin = list(self.allowed_users)[0] if self.allowed_users else None
 
     def _ensure_storage_exists(self):
         os.makedirs(os.path.dirname(self.filepath), exist_ok=True)
