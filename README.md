@@ -42,6 +42,24 @@ A functional setup requires:
 - a local Qdrant instance for vector memory
 - a Telegram bot token and a registration token
 
+## Development platform
+
+```bash
+╔════════════════════════════════════════════════════╗
+║           SETH AI DEVELOPMENT PLATFORM             ║
+╠════════════════════════════════════════════════════╣
+║ CPU          : AMD Ryzen 9 9950X3D                 ║
+║ RAM          : 128 GB DDR5-6000 G.Skill            ║
+║ Primary GPU  : ASUS ROG Astral RTX 5090 32 GB      ║
+║ Secondary GPU: NVIDIA RTX 3050 6 GB                ║
+║ Storage      : 3 × Samsung 990 Pro 4 TB NVMe       ║
+║ Mainboard    : ASUS ProArt X870E-Creator WiFi      ║
+║ PSU          : Seasonic PRIME TX-1600 Titanium     ║
+║ Cooling      : Arctic Liquid Freezer III Pro 420   ║
+║ Chassis      : Fractal Design Define 7 XL          ║
+╚════════════════════════════════════════════════════╝
+```
+
 ## Environment variables
 
 The bot reads configuration from environment variables and defaults where appropriate. At minimum, the following are expected for normal execution:
@@ -102,7 +120,7 @@ Example command to expose a local transcription endpoint:
 faster-whisper-server --port 8010 large-v3
 ```
 
-### Qdrant (with fix for my WSL2)
+### Qdrant (with quick and dirty fix for my WSL2)
 
 Example command to run a local Qdrant instance:
 
