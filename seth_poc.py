@@ -866,10 +866,8 @@ class SethSpeechGenerationTool:
 
     def _init_tts(self):
         if self._pipeline is None:
-            logging.info("⏳ KPipeline...")
             try:
                 self._pipeline = KPipeline(lang_code=self.lang_code)
-                logging.info("✅ KPipeline... OK!")
             except Exception as e:
                 logging.error(f"❌ Error initializing KPipeline: {e}")
                 raise e
