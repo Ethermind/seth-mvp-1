@@ -842,14 +842,11 @@ class SethImageGenerationTool:
             await asyncio.sleep(self.idle_timeout_secs)
             async with self._lock:
                 if self._pipe is not None:
-                    logging.info(f"♻️ [VRAM CLEANUP] 5 min of inactivity reached. Unloading Image Pipeline from {self.device}...")
                     self._pipe = None
-                    if "cuda" in str(self.device):
-                        torch.cuda.empty_cache()
-                    logging.info("♻️ [VRAM CLEANUP] VRAM successfully released.")
+                    torch.cuda.empty_cache()
+                    logging.info(f"♻️ [VRAM CLEANUP] 5 min of inactivity reached. Unloading Image Pipeline from {self.device}...")
         except asyncio.CancelledError as e:
-            logging.info(f"♻️ [VRAM CLEANUP DELAYED] {e}")
-            pass
+            logging.info("♻️ [VRAM CLEANUP] Timer cancelled due to new request.")
 
 
 class SethSpeechGenerationTool:
@@ -1895,7 +1892,6 @@ def main():
     regulator = SethDynamicRegulator(state=current_state, env=env)
 
     security_manager = SethSecurityBoss(env=env)
-
 
     bot_ui = SethTelegramBot(client=vllm_client, env=env, tools_manager=tools_manager, regulator=regulator, memory_tool=memory_tool, whisper_client=whisper_client, security_manager=security_manager)
     bot_ui.run()
