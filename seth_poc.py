@@ -1194,8 +1194,12 @@ class SethChatBot:
         available_output_slots = max_allowed_context - estimated_input_tokens
         requested_output = kwargs.get("max_tokens", 1024)
 
+        min_output_tokens = 256
+        if available_output_slots < min_output_tokens:
+            raise ValueError(f"⚠️ [CONTEXT OVERFLOW] Estimated input tokens ({estimated_input_tokens}) exceed the model's max context ({max_allowed_context}).")
+
         if requested_output > available_output_slots:
-            adjusted_output = max(512, available_output_slots - 50)
+            adjusted_output = available_output_slots - 50
             logging.warning(
                 f"⚠️ [CONTEXT OVERFLOW] ({estimated_input_tokens}, {requested_output}, {adjusted_output})."
             )
@@ -1207,10 +1211,21 @@ class SethChatBot:
         """Executes one tool call and returns its message dict. Never raises —
         errors are captured into the tool result so one bad call can't sink the batch."""
         name = tc.function.name
+        raw_args = tc.function.arguments
+
         try:
-            args = json.loads(tc.function.arguments) if tc.function.arguments else {}
-        except Exception:
-            args = {}
+            args = json.loads(raw_args) if raw_args else {}
+        except json.JSONDecodeError as e:
+            logging.error(f"🛠️ Tool '{name}' called with malformed JSON args: {raw_args!r} ({e})")
+            return {
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "name": name,
+                "content": (
+                    f"Error: the arguments for '{name}' were not valid JSON ({e}). "
+                    f"Re-emit the tool call with well-formed JSON arguments."
+                )
+            }
 
         logging.info(f"🛠️ Executing tool: {name} with args: {args}")
         fn = self.tools_manager.get_function(name) if (self.tools_manager and name) else None
