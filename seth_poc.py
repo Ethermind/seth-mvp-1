@@ -1,5 +1,6 @@
 """
 SETH-IN-A-BOX
+"Inspired by my prompt engineering research and publications on Medium: https://medium.com/@luis.capra"
 """
 
 from __future__ import annotations
