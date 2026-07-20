@@ -236,15 +236,15 @@ sudo chmod 777 /sys/fs/cgroup/memory.high
 ./qdrant
 ```
 
-### NEO4J (using docker.. hate that..)
+### NEO4J (using docker.. sorry for that..)
 
 ```bash
 docker run -d \
   --name seth-neo4j \
   -p 7474:7474 -p 7687:7687 \
-  -v /neo4j_logs:/logs \
-  -v /neo4j_data:/data \
-  -e NEO4J_AUTH=USER/PASSWORD \
+  -v <PATH>/neo4j_logs:/logs \
+  -v <PATH>/neo4j_data:/data \
+  -e NEO4J_AUTH=<USER>/<PASSWORD> \
   neo4j:5.26-community
 ```
 
