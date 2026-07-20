@@ -211,13 +211,13 @@ NOTE: I dont recommend the use of /Systran/faster-whisper-medium .. it's not rel
 faster-whisper-server --port 8010 large-v3
 ```
 
-### Your Qdrant (how it should be!)
+### Qdrant
 
 ```bash
 ./qdrant
 ```
 
-### MY! Qdrant (with quick and dirty fix for WSL2)
+### Qdrant Luisito's version (with quick and dirty fix for WSL2)
 
 ```bash
 # 1. Create the system control group directory structure
