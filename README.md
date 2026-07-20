@@ -1,4 +1,5 @@
 # SETH-IN-A-BOX
+###### "Inspired by my prompt engineering research and publications on Medium: https://medium.com/@luis.capra"
 
 SETH-IN-A-BOX is a local, multimodal Telegram agent implemented around the main runtime in seth_poc.py. It is intended as a technical prototype for experimenting with local LLM orchestration, tool use, per-user memory, and media generation without depending on external cloud services for the core inference path.
 
