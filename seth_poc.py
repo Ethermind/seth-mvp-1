@@ -54,8 +54,15 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, Messa
 from telegram.request import HTTPXRequest
 import torch
 from transformers import AutoTokenizer
+from graphiti_core import Graphiti
+from graphiti_core.nodes import EpisodeType
+from graphiti_core.llm_client import OpenAIClient, LLMConfig
+from graphiti_core.embedder.client import EmbedderClient
+from graphiti_core.cross_encoder.bge_reranker_client import BGERerankerClient
+from graphiti_core.llm_client.gliner2_client import GLiNER2Client
 
 load_dotenv()
+
 
 @dataclass(frozen=True)
 class SethEnvironment:
@@ -79,6 +86,9 @@ class SethEnvironment:
     qdrant_port: int = int(os.getenv("QDRANT_PORT", 6333))
     max_tokens: int = int(os.getenv("MAX_TOKENS", 32768))
     api_key: str = os.getenv("API_KEY", "NONE")
+    neo4j_uri: str = os.getenv("NEO4J_URI", "bolt://localhost:7687")
+    neo4j_user: str = os.getenv("NEO4J_USER", "neo4j")
+    neo4j_password: str = os.getenv("NEO4J_PASSWORD", "")
 
     def validate(self):
         """Validates critical environment variables."""
@@ -727,6 +737,7 @@ class SethSelfInspectorTool:
             report["error"] = str(e)
             return json.dumps(report, ensure_ascii=False)
 
+
 class SethImageGenerationTool:
     """Image generation tool optimized for using the secondary GPU."""
     def __init__(self, env: SethEnvironment):
@@ -1066,6 +1077,117 @@ class SethDynamicRegulator:
         async with self._state_lock:
             return await asyncio.to_thread(self.adjust_regulated_config, query)
 
+
+class LocalBgeEmbedder(EmbedderClient):
+    def __init__(self, sentence_transformer_model):
+        self._model = sentence_transformer_model
+
+    async def create(self, input_data) -> list[float]:
+        texts = input_data if isinstance(input_data, list) else [input_data]
+        vectors = await asyncio.to_thread(self._model.encode, texts)
+        return vectors[0].tolist()
+    
+    async def create_batch(self, input_data_list: list[str]) -> list[list[float]]:
+        vectors = await asyncio.to_thread(self._model.encode, input_data_list)
+        return [v.tolist() for v in vectors]
+
+
+class GraphitiClientSingleton:
+    _instance: "Graphiti | None" = None
+    _lock = asyncio.Lock()
+
+    @classmethod
+    async def get(cls, env: SethEnvironment) -> "Graphiti":
+        if cls._instance is not None:
+            return cls._instance
+
+        async with cls._lock:
+            if cls._instance is None:
+                bge_model = Mem0MemorySingleton.get(env).embedding_model.model
+
+                vllm_backend = OpenAIClient(
+                    config=LLMConfig(
+                        api_key=env.api_key,
+                        model=env.llm_model,
+                        small_model=env.llm_model,
+                        base_url=env.vllm_url,
+                    )
+                )
+
+                llm_client = await asyncio.to_thread(GLiNER2Client, llm_client=vllm_backend)
+ 
+                graphiti = Graphiti(
+                    uri=env.neo4j_uri,
+                    user=env.neo4j_user,
+                    password=env.neo4j_password,
+                    llm_client=llm_client,
+                    embedder=LocalBgeEmbedder(bge_model),
+                    cross_encoder=BGERerankerClient(),
+                )
+
+                logging.info("🕸️ [GRAPHITI] Building indices and constraints in Neo4j...")
+                await graphiti.build_indices_and_constraints()
+                cls._instance = graphiti
+
+        return cls._instance
+    
+
+class SethGraphMemory:
+    def __init__(self, env: SethEnvironment):
+        self.env = env
+
+    def append(self, user_id: str, user_text: str, response: str):
+        async def _do_append():
+            try:
+                graphiti = await GraphitiClientSingleton.get(self.env)
+                await graphiti.add_episode(
+                    name=f"seth_turn_{user_id}_{int(time.time())}",
+                    episode_body=f"User: {user_text}\nAssistant: {response}",
+                    source=EpisodeType.message,
+                    source_description="Telegram conversation turn",
+                    reference_time=datetime.now(),
+                    group_id=user_id
+                )
+                logging.info(f"🕸️ [GRAPHITI] Episode saved for user={user_id}.")
+            except Exception as e:
+                logging.warning(f"⚠️ [GRAPHITI] Error saving episode (non-critical): [{e}]")
+
+        asyncio.create_task(_do_append())
+
+
+class SethGraphQueryTool:
+    def __init__(self, env: SethEnvironment):
+        self.env = env
+
+    @SethToolsManager.tool
+    async def query_relationship_graph(
+        self,
+        query: Annotated[str, (
+            "Natural language question about relationships between people, projects, "
+            "or events, or about how something changed over time. "
+            "Use ONLY for relational/temporal questions (e.g. 'who introduced me to X', "
+            "'how did my opinion on Y change'). Do NOT use for simple fact lookups — "
+            "those are already covered by long-term memory."
+        )],
+    ) -> str:
+        """
+        Queries the temporal knowledge graph for facts about relationships between
+        entities and how they evolved over time. This is a slower, deeper search than
+        regular memory — reserve it for questions that need relational reasoning,
+        not simple fact recall.
+        """
+        user_id = current_user_id.get()
+        try:
+            graphiti = await GraphitiClientSingleton.get(self.env)
+            results = await graphiti.search(query=query, group_ids=[user_id])
+            if not results:
+                return "No relevant relationships found in the graph."
+            facts = [f"- {r.fact}" for r in results]
+            return "\n".join(facts)
+        except Exception as e:
+            logging.warning(f"⚠️ [GRAPHITI] Error in query_relationship_graph: {e}")
+            return "Graph query failed (non-critical)."
+        
 
 class SethChatBot:
     """Wraps the OpenAI client and orchestrates async chat calls and execution loop."""
@@ -1478,6 +1600,7 @@ class SethTelegramBot(SethChatBot):
                  security_manager: SethSecurityBoss):
         super().__init__(client, env, tools_manager, regulator, memory_tool)
         self.short_memory = SethShortMemory(self.env)
+        self.graph_memory = SethGraphMemory(self.env)
         self.system_prompt = self.short_memory.system_prompt()
         self.whisper_client = whisper_client
         self.security_manager = security_manager
@@ -1605,6 +1728,7 @@ Podemos hablar sin censura ni límite de tiempo. Puedo generar imágenes, crear 
                 return
 
             self.short_memory.append(telegram_user_id, user_text, response)
+            self.graph_memory.append(telegram_user_id, user_text, response)  # shadow mode
 
             await self._send_long_message(update, response)
         except Exception as e:
@@ -1829,7 +1953,10 @@ Podemos hablar sin censura ni límite de tiempo. Puedo generar imágenes, crear 
         except Exception as e:
             logging.warning(f"⚠️ Cannot split the audio ({e}).")
             return [local_path]
-        
+
+    async def _warm_up_graphiti(self, application):
+        await GraphitiClientSingleton.get(self.env)
+
     def run(self):
         class AuthorizedUserFilter(filters.MessageFilter):
             def __init__(self, security_manager):
@@ -1858,6 +1985,7 @@ Podemos hablar sin censura ni límite de tiempo. Puedo generar imágenes, crear 
                 connect_timeout=15.0,
                 pool_timeout=10.0
             ))
+            .post_init(self._warm_up_graphiti)
             .build()
         )
         app.add_handler(CommandHandler("start", self.start_cmd))
@@ -1887,16 +2015,18 @@ def main():
     env = SethEnvironment()
     env.validate()
 
-    Mem0MemorySingleton.get(env) # force init
+    # force init
+    Mem0MemorySingleton.get(env) 
 
     memory_tool = SethMemoryTool(env=env)
     search_tool = SethSearchTool()
     inspector_tool = SethSelfInspectorTool()
     image_tool = SethImageGenerationTool(env=env)
     speech_tool = SethSpeechGenerationTool(env=env)
+    graph_query_tool = SethGraphQueryTool(env=env)
 
     tools_manager = SethToolsManager()
-    for tool_instance in (search_tool, memory_tool, inspector_tool, image_tool, speech_tool):
+    for tool_instance in (search_tool, memory_tool, inspector_tool, image_tool, speech_tool, graph_query_tool):
         tools_manager.register_instance(tool_instance)
 
     vllm_client = AsyncOpenAI(base_url=env.vllm_url, api_key=env.api_key)
