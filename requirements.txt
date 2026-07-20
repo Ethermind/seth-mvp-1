@@ -1,0 +1,34 @@
+# --- Core runtime ---
+python-dotenv
+python-telegram-bot
+openai
+pydantic
+numpy
+coloredlogs
+
+# --- LLM / embeddings / vision ---
+# torch: install separately with the CUDA build that matches your driver, e.g.:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu128
+torch
+transformers
+sentence-transformers
+diffusers
+
+# --- Audio ---
+kokoro>=0.9.4
+soundfile
+pydub
+# Kokoro also needs the espeak-ng system package (not pip):
+#   sudo apt-get install espeak-ng
+
+# --- Memory ---
+mem0ai
+qdrant-client
+
+# --- Knowledge graph (Graphiti + Neo4j) ---
+# extras: gliner2 (entity extraction) + sentence-transformers (BGE reranker)
+graphiti-core[gliner2,sentence-transformers]
+
+# --- Web search / crawling ---
+ddgs
+crawl4ai
