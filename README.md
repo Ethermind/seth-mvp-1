@@ -41,7 +41,7 @@ Memory is split across two complementary layers: Mem0 + Qdrant handle semantic f
 A functional setup requires:
 
 - Python 3.10 or newer
-- a CUDA-capable GPU for image generation and embedding work is strongly recommended
+- a CUDA-capable GPU for image generation and embedding work is strongly recommended (verified on driver 610.43.02 / CUDA 13.0 toolkit, running torch's cu128 build — the driver is backwards compatible, so cu128 wheels work fine even on newer driver/toolkit versions)
 - a local OpenAI-compatible LLM endpoint such as vLLM
 - a local Whisper-compatible transcription endpoint
 - a local Qdrant instance for vector memory
@@ -65,6 +65,35 @@ A functional setup requires:
 ║ Chassis      : Fractal Design Define 7 XL          ║
 ╚════════════════════════════════════════════════════╝
 ```
+
+The dev box runs Ubuntu under WSL2. Beyond the `.env` file consumed by `seth_poc.py`, a few shell-level variables are needed for the CUDA toolchain and vLLM to behave correctly on the RTX 5090 (Blackwell / `sm_120`) alongside the older RTX 3050. Export these in your `.bashrc` (or an activation script for your conda env) before building anything from source or launching vLLM:
+
+```bash
+# CUDA toolkit used to build torch/vLLM extensions (matches the installed cu128 torch build)
+export CUDA_HOME="/usr/local/cuda-12.8"
+export LD_LIBRARY_PATH="/usr/local/cuda-12.8/lib64:$LD_LIBRARY_PATH"
+
+# Required for the RTX 5090's Blackwell architecture — without this, anything that
+# compiles CUDA kernels from source (flash-attn, punica kernels, etc.) will target
+# the wrong architecture and fail or silently underperform.
+export TORCH_CUDA_ARCH_LIST="12.0"
+
+# Keep GPU indices stable and consistent with nvidia-smi's ordering
+export CUDA_DEVICE_ORDER="PCI_BUS_ID"
+export CUDA_VISIBLE_DEVICES="0,1"   # 0 = RTX 5090, 1 = RTX 3050
+
+# Dual-GPU of mismatched generations (5090 + 3050) can hit NCCL P2P transport issues
+export NCCL_P2P_DISABLE="1"
+
+# vLLM-specific: pins the legacy engine and enables punica kernels for LoRA-style ops
+export VLLM_USE_V1="0"
+export VLLM_INSTALL_PUNICA_KERNELS="1"
+
+# Parallel build jobs when compiling extensions from source
+export MAX_JOBS="8"
+```
+
+Note: `CUDA_HOME` points at the 12.8 toolkit here even though `nvcc --version` may report a newer release (13.0) if you have multiple toolkits installed side by side — what matters is that it matches the CUDA build your installed torch wheel was compiled against (check with `python -c "import torch; print(torch.version.cuda)"`), not the newest toolkit on disk.
 
 ## Environment variables
 
@@ -94,11 +123,57 @@ You can check default values in the `_env.example` file.
 
 ## Running the bot
 
-Install the required dependencies, then start the bot with:
+1. Clone the repo and create a virtual environment:
 
-```bash
-python seth_poc.py
-```
+   ```bash
+   git clone https://github.com/<your-username>/seth-in-a-box.git
+   cd seth-in-a-box
+   python -m venv .venv
+   source .venv/bin/activate
+   ```
+
+2. Install PyTorch first, matching your CUDA driver (verified working with the cu128 build even on driver 610.43.02 / CUDA 13.0, since NVIDIA drivers stay backwards compatible — check the [PyTorch install matrix](https://pytorch.org/get-started/locally/) if your setup differs):
+
+   ```bash
+   pip install torch==2.9.1 torchaudio==2.9.1 torchvision==0.24.1 \
+       --index-url https://download.pytorch.org/whl/cu128
+   ```
+
+   To check your own driver/CUDA situation before picking a build:
+
+   ```bash
+   nvidia-smi                 # driver version + max CUDA it supports
+   nvcc --version              # installed CUDA toolkit, if any
+   python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.get_device_name(0))"
+   ```
+
+   The `CUDA Version` shown by `nvidia-smi` is the *maximum* your driver supports, not necessarily the build torch is actually using — trust the `torch.version.cuda` output over the other two.
+
+3. Install the rest of the dependencies:
+
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+   Kokoro also needs the `espeak-ng` system package:
+
+   ```bash
+   sudo apt-get install espeak-ng
+   ```
+
+4. Copy `_env.example` to `.env` and fill in your tokens/URLs:
+
+   ```bash
+   cp _env.example .env
+   ```
+
+5. Make sure the external services are up before starting the bot: vLLM, the Whisper endpoint, Qdrant, and Neo4j (see [Example services](#example-services-how-i-use-it) below).
+
+6. Start the bot:
+
+   ```bash
+   python seth_poc.py
+   ```
 
 The bot initializes its tools, memory layers, and Telegram interface. Access is initially restricted and can be enabled using the registration token configured in REGISTRATION_TOKEN.
 
@@ -130,7 +205,7 @@ python -m vllm.entrypoints.openai.api_server \
 
 ### Whisper
 
-Example command to expose a local transcription endpoint:
+NOTE: I dont recommend the use of /Systran/faster-whisper-medium .. it's not reliable.
 
 ```bash
 faster-whisper-server --port 8010 large-v3

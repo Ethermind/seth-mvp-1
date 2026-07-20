@@ -1,34 +1,41 @@
+# Pinned to the versions verified working on BEAST5090 (RTX 5090, driver 610.43.02,
+# CUDA 13.0 toolkit / torch cu128 build). See README "Running the bot" for the
+# torch install command (must be installed BEFORE this file, with --index-url).
+
 # --- Core runtime ---
-python-dotenv
-python-telegram-bot
-openai
-pydantic
-numpy
-coloredlogs
+python-dotenv==1.2.1
+python-telegram-bot==22.7
+openai==2.28.0
+pydantic==2.12.5
+numpy==2.2.6
+coloredlogs==15.0.1
 
 # --- LLM / embeddings / vision ---
-# torch: install separately with the CUDA build that matches your driver, e.g.:
-#   pip install torch --index-url https://download.pytorch.org/whl/cu128
-torch
-transformers
-sentence-transformers
-diffusers
+# torch/torchaudio/torchvision: install separately BEFORE this file, matching your
+# CUDA driver, e.g.:
+#   pip install torch==2.9.1 torchaudio==2.9.1 torchvision==0.24.1 \
+#       --index-url https://download.pytorch.org/whl/cu128
+transformers==5.5.4
+sentence-transformers==5.2.3
+diffusers==0.38.0
 
 # --- Audio ---
-kokoro>=0.9.4
-soundfile
-pydub
+kokoro==0.9.4
+soundfile==0.14.0
+pydub==0.25.1
 # Kokoro also needs the espeak-ng system package (not pip):
 #   sudo apt-get install espeak-ng
 
 # --- Memory ---
-mem0ai
-qdrant-client
+mem0ai==2.0.11
+qdrant-client==1.17.0
 
 # --- Knowledge graph (Graphiti + Neo4j) ---
 # extras: gliner2 (entity extraction) + sentence-transformers (BGE reranker)
-graphiti-core[gliner2,sentence-transformers]
+graphiti-core[gliner2,sentence-transformers]==0.29.2
+gliner2==1.3.2
+neo4j==6.2.0
 
 # --- Web search / crawling ---
-ddgs
-crawl4ai
+ddgs==9.14.2
+crawl4ai==0.8.6
