@@ -33,7 +33,7 @@ from typing import (
     get_origin,
     get_type_hints,
 )
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import coloredlogs
 from crawl4ai import AsyncWebCrawler, BrowserConfig, CacheMode, CrawlerRunConfig
@@ -82,6 +82,8 @@ class SethEnvironment:
     state_path: str = "seth.state"
     storage_images_dir: str = "storage/images"
     storage_audio_dir: str = "storage/audio"
+    reasoning_audit_dir: str = "storage/logs/reasoning"
+    reasoning_audit_retention_days: int = int(os.getenv("AUDIT_LOG_RETENTION_DAYS", 30))
     qdrant_host: str = os.getenv("QDRANT_HOST", "localhost")
     qdrant_port: int = int(os.getenv("QDRANT_PORT", 6333))
     max_tokens: int = int(os.getenv("MAX_TOKENS", 32768))
@@ -1199,6 +1201,55 @@ class SethChatBot:
         self.regulator = regulator
         self.tokenizer = AutoTokenizer.from_pretrained(self.env.llm_model, trust_remote_code=True)
 
+        os.makedirs(self.env.reasoning_audit_dir, exist_ok=True)
+        self._last_audit_cleanup_ts: float = 0.0
+
+    def _persist_reasoning_audit(self, record: dict) -> None:
+        """Blocking write of one audit JSON + opportunistic retention sweep.
+        Meant to run inside a thread (see _save_reasoning_audit)."""
+        user_fragment = re.sub(r"[^A-Za-z0-9_\-]", "_", str(record.get("user_id", "unknown"))) or "unknown"
+        ts_fragment = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"{ts_fragment}_{user_fragment}_{record['audit_id']}.json"
+        filepath = os.path.join(self.env.reasoning_audit_dir, filename)
+
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(record, f, indent=2, ensure_ascii=False, default=str)
+
+        self._maybe_cleanup_reasoning_audits()
+
+    def _maybe_cleanup_reasoning_audits(self) -> None:
+        """Deletes audit files older than reasoning_audit_retention_days. Throttled to
+        run at most once every 6h per process so the write path stays cheap even with
+        thousands of files on disk."""
+        now = time.time()
+        if now - self._last_audit_cleanup_ts < 6 * 3600:
+            return
+        self._last_audit_cleanup_ts = now
+
+        retention_seconds = self.env.reasoning_audit_retention_days * 86400
+        try:
+            removed = 0
+            for entry in os.scandir(self.env.reasoning_audit_dir):
+                if entry.is_file() and (now - entry.stat().st_mtime) > retention_seconds:
+                    os.remove(entry.path)
+                    removed += 1
+            if removed:
+                logging.info(f"🧹 [AUDIT CLEANUP] Pruned {removed} reasoning audit file(s) older than {self.env.reasoning_audit_retention_days}d.")
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            logging.warning(f"⚠️ [AUDIT CLEANUP] Error pruning old reasoning audits (non-critical): [{e}]")
+
+    def _save_reasoning_audit(self, record: dict) -> None:
+        """Fire-and-forget persistence so auditing never adds latency to the chat reply path."""
+        async def _do_save():
+            try:
+                await asyncio.to_thread(self._persist_reasoning_audit, record)
+            except Exception as e:
+                logging.warning(f"⚠️ [AUDIT] Error saving reasoning audit (non-critical): [{e}]")
+
+        asyncio.create_task(_do_save())
+
     def _dump_messages_for_logging(self, messages: list[dict]) -> str:
         out = []
 
@@ -1245,25 +1296,64 @@ class SethChatBot:
         local_messages = await self._inject_memory_context(local_messages, pure_text_query)
         config = await self._resolve_inference_config(pure_text_query)
 
-        for hop in range(max_tool_hops):
-            logging.info(
-                f"🧠 Calling vLLM (tool hop {hop + 1}/{max_tool_hops}).\n%s",
-                self._dump_messages_for_logging(local_messages)
-            )
+        audit = {
+            "audit_id": uuid4().hex[:8],
+            "timestamp_start": datetime.now().isoformat(),
+            "timestamp_end": None,
+            "user_id": current_user_id.get(),
+            "query": pure_text_query,
+            "inference_config": config,
+            "hops": [],
+            "final_response": None,
+            "hop_count": 0,
+            "hit_hop_limit": False,
+            "error": None,
+            "full_context": None,
+        }
 
-            response = await self._llm_call(local_messages, tools=tools, config=config)
-            message = response.choices[0].message
-            local_messages.append(self._serialize_completion_message(message))
+        try:
+            for hop in range(max_tool_hops):
+                logging.info(
+                    f"🧠 Calling vLLM (tool hop {hop + 1}/{max_tool_hops}).\n%s",
+                    self._dump_messages_for_logging(local_messages)
+                )
 
-            if not getattr(message, 'tool_calls', None):
-                return message.content or ""
+                response = await self._llm_call(local_messages, tools=tools, config=config)
+                message = response.choices[0].message
+                serialized = self._serialize_completion_message(message)
+                local_messages.append(serialized)
 
-            logging.info(f"🛠️ [TOOL HOP {hop + 1}] Model requested {len(message.tool_calls)} tool call(s).")
-            local_messages = await self._execute_tool_calls(message.tool_calls, local_messages)
+                audit["hop_count"] = hop + 1
+                audit["hops"].append({
+                    "hop_number": hop + 1,
+                    "reasoning_content": serialized.get("reasoning_content"),
+                    "tool_calls_requested": serialized.get("tool_calls"),
+                    "tool_results": None,
+                })
 
-        logging.warning(f"⚠️ [TOOL HOP LIMIT] Reached {max_tool_hops} tool hops.")
-        final_response = await self._llm_call(local_messages, tools=None, config=config)
-        return final_response.choices[0].message.content or "❌ Error: Tool hop limit reached."
+                if not getattr(message, 'tool_calls', None):
+                    audit["final_response"] = message.content or ""
+                    return audit["final_response"]
+
+                logging.info(f"🛠️ [TOOL HOP {hop + 1}] Model requested {len(message.tool_calls)} tool call(s).")
+                pre_len = len(local_messages)
+                local_messages = await self._execute_tool_calls(message.tool_calls, local_messages)
+                audit["hops"][-1]["tool_results"] = local_messages[pre_len:]
+
+            logging.warning(f"⚠️ [TOOL HOP LIMIT] Reached {max_tool_hops} tool hops.")
+            audit["hit_hop_limit"] = True
+            final_response = await self._llm_call(local_messages, tools=None, config=config)
+            audit["final_response"] = final_response.choices[0].message.content or "❌ Error: Tool hop limit reached."
+            return audit["final_response"]
+
+        except Exception as e:
+            audit["error"] = str(e)
+            raise
+
+        finally:
+            audit["timestamp_end"] = datetime.now().isoformat()
+            audit["full_context"] = local_messages
+            self._save_reasoning_audit(audit)
 
     def _extract_text_query(self, messages: list[dict]) -> str:
         """Extract the plain text from the last message, whether it's a string or a multimodal list."""
