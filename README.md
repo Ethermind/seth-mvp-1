@@ -276,5 +276,5 @@ The architecture is built from the ground up to favor absolute local latency eff
 * **Reranker (bge-reranker-v2-m3):** ~2.0 GB VRAM, shared between memory retrieval and Graphiti graph search.
 * **Neo4j (Graphiti's graph store):** runs in Docker on CPU/RAM, no VRAM footprint.
 
-At this configuration, total steady-state VRAM usage sits right at the RTX 5090's ceiling (~30.9/31.5 GB), so there's effectively no headroom left for additional GPU-resident components.
+#### At this configuration, total steady-state VRAM usage sits right at the RTX 5090's ceiling (~30.9/31.5 GB), so there's effectively no headroom left for additional GPU-resident components.
 ---
