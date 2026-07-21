@@ -50,6 +50,9 @@ A functional setup requires:
 
 ## Development platform
 
+Honestly... I REALLY know this is not a common setup.
+But I'm building this with the near future in mind, when this kind of hardware will become more common.
+
 ```bash
 ╔════════════════════════════════════════════════════╗
 ║           SETH AI DEVELOPMENT PLATFORM             ║
@@ -167,9 +170,15 @@ You can check default values in the `_env.example` file.
    cp _env.example .env
    ```
 
-5. Make sure the external services are up before starting the bot: vLLM, the Whisper endpoint, Qdrant, and Neo4j (see [Example services](#example-services-how-i-use-it) below).
+5. Download Dreamshaper and put in in the models folder (This model cant be automatically downloaded by huggingface):
 
-6. Start the bot:
+   ```bash
+   hf download digiplay/DreamShaper_8 dreamshaper_8.safetensors --local-dir models
+   ```
+
+6. Make sure the external services are up before starting the bot: vLLM, the Whisper endpoint, Qdrant, and Neo4j (see [Example services](#example-services-how-i-use-it) below).
+
+7. Start the bot:
 
    ```bash
    python seth_poc.py
@@ -181,7 +190,12 @@ The bot initializes its tools, memory layers, and Telegram interface. Access is 
 
 ### vLLM
 
-Example command to start an OpenAI-compatible local inference server:
+Example command to start an OpenAI-compatible local inference server.
+These arguments are specific to my hardware and desired software, including the model.
+
+vLLM is more complicated than it sounds — it requires (for me, at least so far) a local build related to my hardware, which makes it a bit tricky. It's just not Ollama.
+
+I also tested SGLang, but for some reason it pushed my GPU too aggressively. That's why I discarded it for now — but I really want to give it another shot in the future!
 
 ```bash
 python -m vllm.entrypoints.openai.api_server \
