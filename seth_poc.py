@@ -11,8 +11,7 @@ import base64
 from collections import deque
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, fields, is_dataclass, replace, MISSING
-from datetime import datetime, timedelta
-from datetime import date as _dt_date, time as _dt_time
+from datetime import datetime, timedelta, date, time as _dt_time
 import enum
 from functools import lru_cache
 import io
@@ -269,7 +268,7 @@ class SethToolsManager:
         if tp is datetime:
             return {"type": "string", "format": "date-time"}
 
-        if tp is _dt_date:
+        if tp is date:
             return {"type": "string", "format": "date"}
 
         if tp is _dt_time:
@@ -1216,6 +1215,10 @@ class SethChatBot:
                 out.append("tool_calls =")
                 out.append(json.dumps(msg["tool_calls"], indent=2, ensure_ascii=False))
 
+            if msg.get("reasoning_content"):
+                out.append("💭 reasoning_content =")
+                out.append(str(msg["reasoning_content"]).strip())
+
             content = msg.get("content")
 
             if isinstance(content, list):
@@ -1386,7 +1389,11 @@ class SethChatBot:
             "role": "assistant",
             "content": content
         }
-        
+
+        reasoning = getattr(message, 'reasoning_content', None)
+        if reasoning:
+            msg_dict["reasoning_content"] = reasoning
+
         tool_calls = getattr(message, 'tool_calls', None)
         if tool_calls:
             msg_dict["tool_calls"] = [
