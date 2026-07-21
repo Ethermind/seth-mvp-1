@@ -87,6 +87,7 @@ class SethEnvironment:
     qdrant_host: str = os.getenv("QDRANT_HOST", "localhost")
     qdrant_port: int = int(os.getenv("QDRANT_PORT", 6333))
     max_tokens: int = int(os.getenv("MAX_TOKENS", 32768))
+    llm_enable_thinking: bool = os.getenv("LLM_ENABLE_THINKING", "1").strip().lower() in ("1", "true", "yes")
     api_key: str = os.getenv("API_KEY", "NONE")
     neo4j_uri: str = os.getenv("NEO4J_URI", "bolt://localhost:7687")
     neo4j_user: str = os.getenv("NEO4J_USER", "neo4j")
@@ -1266,10 +1267,6 @@ class SethChatBot:
                 out.append("tool_calls =")
                 out.append(json.dumps(msg["tool_calls"], indent=2, ensure_ascii=False))
 
-            if msg.get("reasoning_content"):
-                out.append("💭 reasoning_content =")
-                out.append(str(msg["reasoning_content"]).strip())
-
             content = msg.get("content")
 
             if isinstance(content, list):
@@ -1323,10 +1320,14 @@ class SethChatBot:
                 serialized = self._serialize_completion_message(message)
                 local_messages.append(serialized)
 
+                reasoning = getattr(message, 'reasoning', None)
+                if reasoning:
+                    logging.info(f"💭 [GEMMA 4 REASONING hop {hop + 1}]:\n{reasoning.strip()}")
+
                 audit["hop_count"] = hop + 1
                 audit["hops"].append({
                     "hop_number": hop + 1,
-                    "reasoning_content": serialized.get("reasoning_content"),
+                    "reasoning": reasoning,
                     "tool_calls_requested": serialized.get("tool_calls"),
                     "tool_results": None,
                 })
@@ -1401,6 +1402,12 @@ class SethChatBot:
         if tools:
             kwargs.update(tools=tools, tool_choice="auto")
 
+        if self.env.llm_enable_thinking:
+            kwargs["extra_body"] = {
+                "chat_template_kwargs": {"enable_thinking": True},
+                "skip_special_tokens": False,
+            }
+
         formatted_chat = self.tokenizer.apply_chat_template(
             messages, tools=tools, tokenize=True, add_generation_prompt=True
         )
@@ -1472,17 +1479,15 @@ class SethChatBot:
 
     @staticmethod
     def _serialize_completion_message(message: Any) -> dict:
-        """ Converts an OpenAI ChatCompletionMessage into a flat dictionary strictly compatible with vLLM chat templates. """
+        """ Converts an OpenAI ChatCompletionMessage into a flat dictionary strictly compatible with vLLM chat templates.
+        Deliberately does NOT carry the model's `reasoning` field back into the conversation history: Gemma 4's own
+        chat template guidance is explicit that thoughts from previous turns must not be re-added to the prompt. """
         content = message.content if message.content is not None else ""
         
         msg_dict = {
             "role": "assistant",
             "content": content
         }
-
-        reasoning = getattr(message, 'reasoning_content', None)
-        if reasoning:
-            msg_dict["reasoning_content"] = reasoning
 
         tool_calls = getattr(message, 'tool_calls', None)
         if tool_calls:
