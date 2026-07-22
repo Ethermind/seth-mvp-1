@@ -51,11 +51,11 @@ A functional setup requires:
 ## Development platform
 
 Honestly... I REALLY know this is not a common setup.
-But I'm building this with the near future in mind, when this kind of hardware will become more common.
+But I'm building this with the near future in mind, when this kind of hardware will become more accesible.
 
 ```bash
 ╔════════════════════════════════════════════════════╗
-║           SETH AI DEVELOPMENT PLATFORM             ║
+║           THE BOX (in SETH-IN-A-BOX)               ║
 ╠════════════════════════════════════════════════════╣
 ║ CPU          : AMD Ryzen 9 9950X3D                 ║
 ║ RAM          : 128 GB DDR5-6000 G.Skill            ║
@@ -216,6 +216,8 @@ python -m vllm.entrypoints.openai.api_server \
   --reasoning-parser gemma4 \
   --chat-template examples/tool_chat_template_gemma4.jinja
 ```
+
+Currently, I am using the abhishekchohan/gemma-4-26B-A4B-it-abliterated-AWQ model, as I consider it the best fit for my hardware setup and requirements. However, since its documentation is virtually non-existent, a safer and more standard alternative like nvidia/Gemma-4-26B-A4B-NVFP4 is recommended.
 
 ### Whisper
 

@@ -67,7 +67,7 @@ load_dotenv()
 @dataclass(frozen=True)
 class SethEnvironment:
     """Centralized and typed configuration for the SETH ecosystem."""
-    llm_model: str = os.getenv("LLM_MODEL", "abhishekchohan/gemma-4-26B-A4B-it-abliterated-AWQ")
+    llm_model: str = os.getenv("LLM_MODEL", "nvidia/Gemma-4-26B-A4B-NVFP4")
     vllm_url: str = os.getenv("VLLM_URL", "http://localhost:8000/v1")
     whisper_url: str = os.getenv("WHISPER_URL", "http://localhost:8010/v1")
     whisper_model: str = os.getenv("WHISPER_MODEL", "large-v3")
