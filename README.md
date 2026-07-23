@@ -271,12 +271,12 @@ docker run -d \
 The architecture is built from the ground up to favor absolute local latency efficiency and prefix-cache retention. The physical memory partitioning is strategically budgeted to sustain a massive, non-linear **128k native token context window**:
 
 * **LLM Core Engine (Gemma-4 26B - AWQ Quantized):** ~17.5 GB VRAM.
-* **Embedding Matrix (BGE-Large-En-v1.5):** ~2.0 GB VRAM. Doubles as the embedder for the Graphiti knowledge graph.
+* **Embedding Matrix for RAG Dynamic SETH states and  Graphiti knowledge graph (BGE-Large-En-v1.5):** ~2.0 GB VRAM.
 * **Dynamic KV-Cache (FP8 Execution Window, `--max-model-len 131072`):** ~7.5 GB VRAM. ~183K tokens of GPU KV cache at the current config.
 * **Difussion model (Dreamshaper8 on non dedicated CUDA:1):** ~3.0 GB VRAM. Used due hardware limitations :(
 * **Voice Generation (Kokoro):** Runs on CPU!
-* **Reranker (bge-reranker-v2-m3):** ~2.0 GB VRAM, shared between memory retrieval and Graphiti graph search.
-* **Neo4j (Graphiti's graph store):** runs in Docker on CPU/RAM, no VRAM footprint.
+* **Reranker for Graphiti (bge-reranker-v2-m3):** ~2.0 GB VRAM, shared between memory retrieval and Graphiti graph search.
+* **Neo4j for Graphiti (graph store):** runs in Docker on CPU/RAM, no VRAM footprint.
 
 #### At this configuration, total steady-state VRAM usage sits right at the RTX 5090's ceiling (~30.9/31.5 GB), so there's effectively no headroom left for additional GPU-resident components.
 ---

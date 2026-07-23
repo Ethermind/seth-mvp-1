@@ -956,9 +956,10 @@ class SethState:
         new_tokens = self.max_tokens + alpha * (target.max_tokens - self.max_tokens)
         self.max_tokens = int(new_tokens)
 
-    def save(self, env: SethEnvironment):
-        """Schedules the current hyperparameter state to be persisted asynchronously."""
-        filename = env.state_path
+    def save(self, env: SethEnvironment, filename: str | None = None):
+        """Schedules the current hyperparameter state to be persisted asynchronously.
+        `filename` overrides env.state_path — used for per-user state files."""
+        filename = filename or env.state_path
         state_data = self.to_dict()
 
         try:
@@ -968,8 +969,8 @@ class SethState:
         except Exception as e:
             logging.error(f"❌ Error in background thread saving {filename}: {e}")
 
-    def load(self, env: SethEnvironment) -> bool:
-        filename = env.state_path
+    def load(self, env: SethEnvironment, filename: str | None = None) -> bool:
+        filename = filename or env.state_path
 
         if not os.path.exists(filename):
             logging.info(f"ℹ️ No previous state file found at {filename}. Using default values.")
@@ -1016,16 +1017,54 @@ class SethStatePresets:
         return SethState(0.85, 4096, 0.95, 0.4)
     
 
+class SethStateManager:
+    """Per-user SethState store, mirroring the SethShortMemory pattern:
+    one SethState + one asyncio.Lock per user_id, persisted to its own
+    JSON file (seth_state_<user_id>.json) instead of a single shared
+    seth.state. Keys only off the (channel-agnostic) user_id string, so
+    it works the same for Telegram, WhatsApp, or web sessions."""
+
+    def __init__(self, env: SethEnvironment):
+        self.env = env
+        self._states: Dict[str, SethState] = {}
+        self._locks: Dict[str, asyncio.Lock] = {}
+
+    def _safe_user_fragment(self, user_id: str) -> str:
+        return re.sub(r"[^A-Za-z0-9_\-]", "_", str(user_id)) or "unknown"
+
+    def _path_for(self, user_id: str) -> str:
+        base, ext = os.path.splitext(self.env.state_path)
+        return f"{base}_{self._safe_user_fragment(user_id)}{ext or '.json'}"
+
+    def get_lock(self, user_id: str) -> asyncio.Lock:
+        lock = self._locks.get(user_id)
+        if lock is None:
+            lock = self._locks.setdefault(user_id, asyncio.Lock())
+        return lock
+
+    def get_state(self, user_id: str) -> "SethState":
+        state = self._states.get(user_id)
+        if state is None:
+            state = replace(SethStatePresets.DEFAULT)
+            state.load(self.env, filename=self._path_for(user_id))
+            self._states[user_id] = state
+        return state
+
+    def save_state(self, user_id: str, state: "SethState"):
+        state.save(self.env, filename=self._path_for(user_id))
+
+
 class SethDynamicRegulator:
     """Orchestrates semantic state shifts based on real-time query intent.
     
     Optimized to load local weights and cache behavioral target anchors.
+    State is now resolved per-user via SethStateManager, so concurrent
+    users no longer share (and clobber) the same temperature/top_p.
     """
-    def __init__(self, state: Any, env: SethEnvironment, alpha: float = 0.2):
+    def __init__(self, state_manager: SethStateManager, env: SethEnvironment, alpha: float = 0.2):
         self.env = env
         self.alpha = alpha
-        self.current_state = state
-        self._state_lock = asyncio.Lock()
+        self.state_manager = state_manager
         
         #HACK: try to avoid the use AGAIN of SentenceTransformer
         try:
@@ -1050,7 +1089,7 @@ class SethDynamicRegulator:
             }
         }
 
-    def adjust_regulated_config(self, query: Any) -> Dict[str, Any]:
+    def adjust_regulated_config(self, query: Any, user_id: str) -> Dict[str, Any]:
         text_query = ""
 
         if isinstance(query, list):
@@ -1070,15 +1109,17 @@ class SethDynamicRegulator:
             key=lambda x: x[1]
         )
 
-        self.current_state.interpolate(self.targets[best_name]["state"], self.alpha)
-        self.current_state.save(self.env)
+        state = self.state_manager.get_state(user_id)
+        state.interpolate(self.targets[best_name]["state"], self.alpha)
+        self.state_manager.save_state(user_id, state)
         
-        logging.info(f"🌀 STATE ADJUSTMENT [{best_name.upper()}] - New Temp: {self.current_state.temperature:.3f}")
-        return self.current_state.to_dict()
+        logging.info(f"🌀 STATE ADJUSTMENT [{best_name.upper()}] user={user_id} - New Temp: {state.temperature:.3f}")
+        return state.to_dict()
 
-    async def async_adjust_regulated_config(self, query: Any) -> Dict[str, Any]:
-        async with self._state_lock:
-            return await asyncio.to_thread(self.adjust_regulated_config, query)
+    async def async_adjust_regulated_config(self, query: Any, user_id: str) -> Dict[str, Any]:
+        lock = self.state_manager.get_lock(user_id)
+        async with lock:
+            return await asyncio.to_thread(self.adjust_regulated_config, query, user_id)
 
 
 class LocalBgeEmbedder(EmbedderClient):
@@ -1393,7 +1434,7 @@ class SethChatBot:
     async def _resolve_inference_config(self, query: str) -> dict:
         """Calculate the dynamic inference configuration based on the query."""
         if self.regulator and query:
-            return await self.regulator.async_adjust_regulated_config(query)
+            return await self.regulator.async_adjust_regulated_config(query, current_user_id.get())
         
         return {}
 
@@ -2134,9 +2175,8 @@ def main():
 
     vllm_client = AsyncOpenAI(base_url=env.vllm_url, api_key=env.api_key)
     whisper_client = AsyncOpenAI(base_url=env.whisper_url, api_key=env.api_key)
-    current_state = replace(SethStatePresets.DEFAULT)
-    current_state.load(env)
-    regulator = SethDynamicRegulator(state=current_state, env=env)
+    state_manager = SethStateManager(env=env)
+    regulator = SethDynamicRegulator(state_manager=state_manager, env=env)
 
     security_manager = SethSecurityBoss(env=env)
 
