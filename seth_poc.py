@@ -599,18 +599,30 @@ class SethMemoryTool:
             "CRITICAL RULES: "
             "1) FOCUS ON THE LATEST EXCHANGE: Target ONLY the specific piece of information, text, or data "
             "introduced in the most recent turn. Do NOT merge older history unless explicitly requested. "
-            "2) EXTRACT THE CONTENT, NOT THE COMMAND: If the user says 'remember that my name is Luis', "
-            "extract 'The user's name is Luis'. If they say 'save this config' after sharing data, extract the actual data. "
-            "Never include conversational triggers like 'save this', 'remember', or 'record'."
+            "2) SOURCE FROM THE USER, NOT THE ASSISTANT: Only extract things the user themselves stated as "
+            "fact. Never save the assistant's own phrasing, interpretations, or figurative language as if "
+            "it were something the user said. "
+            "3) EXTRACT THE CONTENT, NOT THE COMMAND: If the user says 'remember that my name is Luis', "
+            "extract 'The user's name is Luis'. If they say 'save this config' after sharing data, extract "
+            "the actual data. Never include conversational triggers like 'save this', 'remember', or 'record'. "
+            "4) WHEN TRIGGERED PROACTIVELY (no explicit save request): phrase the extracted fact plainly and "
+            "narrowly — e.g. 'User prefers X' or 'User's project is called Y' — not a paraphrase of the whole "
+            "exchange."
         )],
         response: Annotated[str, "The assistant's short confirmation or validation of the fact being stored."],
     ) -> Dict[str, Any]:
         """
-        Persists meaningful facts, technical constraints, decisions, or user preferences into
-        long-term memory. Use this tool whenever the user explicitly asks to remember, save, or
-        persist information, or when a crucial new fact/correction is introduced in the exchange.
+        Persists facts, preferences, decisions, or technical constraints into long-term
+        memory. Use this proactively — not just on explicit request — whenever the user
+        shares information that is likely to matter in future conversations: personal
+        details, stated preferences, recurring context about their projects, corrections
+        to previous assumptions, or decisions they've made.
 
-        Implementation: persists the memory item to the vector store asynchronously.
+        Do NOT save: one-off requests, small talk, information you (the assistant)
+        generated or inferred yourself, or anything the user is still deciding/unsure
+        about. Only save what the USER stated as fact.
+
+        When in doubt about whether something is worth remembering, save it.
         """
         expiration = (datetime.now() + timedelta(days=14)).strftime("%Y-%m-%d")
         user_id = current_user_id.get()
@@ -970,7 +982,6 @@ class SethState:
         filename = filename or env.state_path
 
         if not os.path.exists(filename):
-            logging.info(f"ℹ️ No previous state file found at {filename}. Using default values.")
             return False
             
         try:
@@ -980,11 +991,10 @@ class SethState:
             self.temperature = float(data.get("temperature", self.temperature))
             self.top_p = float(data.get("top_p", self.top_p))
             self.presence_penalty = float(data.get("presence_penalty", self.presence_penalty))
-            
-            logging.info(f"🔄 [STATE LOADED] Continuity restored from {filename} -> Temp: {self.temperature:.3f}")
+
             return True
         except Exception as e:
-            logging.error(f"❌ Error loading seth.state (malformed file?). Keeping defaults. Error: {e}")
+            logging.error(f"❌ Error loading seth.state (malformed file?). Error: {e}")
             return False
         
     def to_dict(self) -> Dict[str, Any]:
@@ -1065,7 +1075,7 @@ class SethDynamicRegulator:
         try:
             self.engine = Mem0MemorySingleton.get(self.env).embedding_model.model
         except Exception as e:
-            logging.error(f"Failed to load embedding model from Memory singleton: {e}")
+            logging.error(f"Failed to load embedding model from Memory singleton (hack is over?): {e}")
             logging.info(f"Loading embedding model using SentenceTransformer: {self.env.embedding_model}")
             self.engine = SentenceTransformer(self.env.embedding_model, device="cuda")
 
@@ -1204,28 +1214,26 @@ class SethGraphQueryTool:
         query: Annotated[str, (
             "Natural language question about relationships between people, projects, "
             "or events, or about how something changed over time. "
-            "Use ONLY for relational/temporal questions (e.g. 'who introduced me to X', "
-            "'how did my opinion on Y change'). Do NOT use for simple fact lookups — "
-            "those are already covered by long-term memory."
         )],
     ) -> str:
         """
         Queries the temporal knowledge graph for facts about relationships between
-        entities and how they evolved over time. This is a slower, deeper search than
-        regular memory — reserve it for questions that need relational reasoning,
-        not simple fact recall.
+        entities and how they evolved over time. Use it freely to answer questions about connections, introductions, and historical changes.
         """
         user_id = current_user_id.get()
         try:
             graphiti = await GraphitiClientSingleton.get(self.env)
-            results = await graphiti.search(query=query, group_ids=[user_id])
+            results = await graphiti.search(query=query, group_ids=[user_id], num_results=16)
+            
             if not results:
                 return "No relevant relationships found in the graph."
-            facts = [f"- {r.fact}" for r in results]
+
+            facts = [f"- {r.fact[:1024]}" for r in results]
+
             return "\n".join(facts)
         except Exception as e:
             logging.warning(f"⚠️ [GRAPHITI] Error in query_relationship_graph: {e}")
-            return "Graph query failed (non-critical)."
+            return "Graph query failed (non-critical). Notify the user that the graph is temporarily unavailable."
         
 
 class SethChatBot:
