@@ -86,7 +86,7 @@ class SethEnvironment:
     reasoning_audit_retention_days: int = int(os.getenv("AUDIT_LOG_RETENTION_DAYS", 30))
     qdrant_host: str = os.getenv("QDRANT_HOST", "localhost")
     qdrant_port: int = int(os.getenv("QDRANT_PORT", 6333))
-    max_tokens: int = int(os.getenv("MAX_TOKENS", 32768))
+    max_tokens: int = int(os.getenv("MAX_TOKENS", 131072))
     llm_enable_thinking: bool = os.getenv("LLM_ENABLE_THINKING", "1").strip().lower() in ("1", "true", "yes")
     api_key: str = os.getenv("API_KEY", "NONE")
     neo4j_uri: str = os.getenv("NEO4J_URI", "bolt://localhost:7687")
@@ -944,17 +944,14 @@ class SethSpeechGenerationTool:
 class SethState:
     """Represents Seth's dynamic inference state"""
     temperature: float
-    max_tokens: int
     top_p: float
     presence_penalty: float
 
-    def interpolate(self, target: 'SethState', alpha: float):
+    def interpolate(self, env: SethEnvironment, target: 'SethState', alpha: float):
         """Smoothly shifts the semantic state towards a specific target behavior."""
         self.temperature += alpha * (target.temperature - self.temperature)
         self.top_p += alpha * (target.top_p - self.top_p)
         self.presence_penalty += alpha * (target.presence_penalty - self.presence_penalty)
-        new_tokens = self.max_tokens + alpha * (target.max_tokens - self.max_tokens)
-        self.max_tokens = int(new_tokens)
 
     def save(self, env: SethEnvironment, filename: str | None = None):
         """Schedules the current hyperparameter state to be persisted asynchronously.
@@ -981,8 +978,6 @@ class SethState:
                 data = json.load(f)
             
             self.temperature = float(data.get("temperature", self.temperature))
-            self.max_tokens = int(data.get("max_tokens", self.max_tokens))
-            #self.max_tokens = env.max_tokens TODO: consider if we want to enforce the env max_tokens or allow state persistence
             self.top_p = float(data.get("top_p", self.top_p))
             self.presence_penalty = float(data.get("presence_penalty", self.presence_penalty))
             
@@ -998,23 +993,23 @@ class SethState:
 
 class SethStatePresets:
     """Standardized behavioral states for the SETH ecosystem."""
-   
-    DEFAULT = SethState(temperature=0.25, max_tokens=1024, top_p=0.85, presence_penalty=0.2)
+
+    DEFAULT = SethState(temperature=0.25, top_p=0.85, presence_penalty=0.2)
     
     @classmethod
     def rigorous(cls) -> SethState:
         """High precision, low temperature for code and architecture tasks."""
-        return SethState(0.1, 2000, 0.7, 0.0)
+        return SethState(temperature=0.1, top_p=0.7, presence_penalty=0.0)
 
     @classmethod
     def chaotic(cls) -> SethState:
         """High entropy for creative glitch-philosophy and humor."""
-        return SethState(1.3, 1000, 0.99, 0.9)
+        return SethState(temperature=1.3, top_p=0.99, presence_penalty=0.9)
 
     @classmethod
     def verbose(cls) -> SethState:
         """Extended context for long-form essays and deep analysis."""
-        return SethState(0.85, 4096, 0.95, 0.4)
+        return SethState(temperature=0.85, top_p=0.95, presence_penalty=0.4)
     
 
 class SethStateManager:
@@ -1110,7 +1105,7 @@ class SethDynamicRegulator:
         )
 
         state = self.state_manager.get_state(user_id)
-        state.interpolate(self.targets[best_name]["state"], self.alpha)
+        state.interpolate(self.env, self.targets[best_name]["state"], self.alpha)
         self.state_manager.save_state(user_id, state)
         
         logging.info(f"🌀 STATE ADJUSTMENT [{best_name.upper()}] user={user_id} - New Temp: {state.temperature:.3f}")
@@ -1357,7 +1352,12 @@ class SethChatBot:
                 )
 
                 response = await self._llm_call(local_messages, tools=tools, config=config)
-                message = response.choices[0].message
+                choice = response.choices[0]
+                message = choice.message
+
+                if choice.finish_reason == "length":
+                    logging.warning("⚠️ [LLM TRUNCATED] Generation hit max_tokens during reasoning or output.")
+
                 serialized = self._serialize_completion_message(message)
                 local_messages.append(serialized)
 
@@ -1374,7 +1374,7 @@ class SethChatBot:
                 })
 
                 if not getattr(message, 'tool_calls', None):
-                    audit["final_response"] = message.content or ""
+                    audit["final_response"] = message.content or "No content returned by model. (?)"
                     return audit["final_response"]
 
                 logging.info(f"🛠️ [TOOL HOP {hop + 1}] Model requested {len(message.tool_calls)} tool call(s).")
@@ -1440,6 +1440,8 @@ class SethChatBot:
 
     async def _llm_call(self, messages: list[dict], tools: list | None, config: dict):
         kwargs = dict(model=self.env.llm_model, messages=messages, **config)
+        kwargs.setdefault("max_tokens", 4096)
+
         if tools:
             kwargs.update(tools=tools, tool_choice="auto")
 
@@ -1456,14 +1458,14 @@ class SethChatBot:
 
         max_allowed_context = self.env.max_tokens
         available_output_slots = max_allowed_context - estimated_input_tokens
-        requested_output = kwargs.get("max_tokens", 1024)
+        requested_output = kwargs["max_tokens"]
 
         min_output_tokens = 256
         if available_output_slots < min_output_tokens:
             raise ValueError(f"⚠️ [CONTEXT OVERFLOW] Estimated input tokens ({estimated_input_tokens}) exceed the model's max context ({max_allowed_context}).")
 
         if requested_output > available_output_slots:
-            adjusted_output = available_output_slots - 50
+            adjusted_output = max(min_output_tokens, available_output_slots - 50)
             logging.warning(f"⚠️ [CONTEXT OVERFLOW] ({estimated_input_tokens}, {requested_output}, {adjusted_output}).")
             kwargs["max_tokens"] = adjusted_output
 
