@@ -1,0 +1,765 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SETH Terminal UI // Project Oracle</title>
+
+  <!-- React 18 & Babel via CDN -->
+  <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+  <!-- Tailwind CSS -->
+  <script src="https://cdn.tailwindcss.com"></script>
+
+  <!-- Retro Monospace Font -->
+  <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&display=swap" rel="stylesheet">
+
+  <style>
+    body {
+      font-family: 'Share Tech Mono', monospace;
+      background-color: #030308;
+      color: #00f0ff;
+    }
+
+    /* CRT Scanlines Overlay */
+    .crt::before {
+      content: " ";
+      display: block;
+      position: absolute;
+      top: 0; left: 0; bottom: 0; right: 0;
+      background: linear-gradient(rgba(18, 16, 16, 0) 50%, rgba(0, 0, 0, 0.4) 50%);
+      background-size: 100% 4px;
+      z-index: 40;
+      pointer-events: none;
+      opacity: 0.75;
+    }
+
+    /* Retro ASCII Scrollbar (WebKit) */
+    ::-webkit-scrollbar { width: 10px; }
+    ::-webkit-scrollbar-track { background: #090914; border-left: 1px solid #00f0ff; }
+    ::-webkit-scrollbar-thumb { background: #00f0ff; border: 1px solid #090914; }
+    ::-webkit-scrollbar-thumb:hover { background: #ff007f; }
+
+    /* Retro ASCII Scrollbar (Firefox) */
+    * { scrollbar-width: thin; scrollbar-color: #00f0ff #090914; }
+
+    /* Neon Glow Effects */
+    .glow-cyan { text-shadow: 0 0 8px rgba(0, 240, 255, 0.8); }
+    .glow-green { text-shadow: 0 0 8px rgba(57, 255, 20, 0.8); }
+    .glow-amber { text-shadow: 0 0 8px rgba(255, 176, 0, 0.8); }
+    .glow-magenta { text-shadow: 0 0 8px rgba(255, 0, 127, 0.8); }
+
+    .box-glow {
+      box-shadow: 0 0 20px rgba(0, 240, 255, 0.15), inset 0 0 10px rgba(0, 240, 255, 0.05);
+    }
+
+    /* Blinking Terminal Cursor */
+    .blink { animation: blinker 1s cubic-bezier(0.5, 0, 1, 1) infinite; }
+    @keyframes blinker { 50% { opacity: 0; } }
+
+    /* REC dot pulse */
+    .rec-pulse { animation: recpulse 1.2s ease-in-out infinite; }
+    @keyframes recpulse {
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50% { opacity: 0.4; transform: scale(0.85); }
+    }
+
+    /* Attachment chip enter */
+    @keyframes chipIn {
+      from { opacity: 0; transform: translateY(4px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+    .chip-in { animation: chipIn 0.15s ease-out; }
+
+    textarea:focus { outline: none; }
+  </style>
+</head>
+<body class="h-screen w-screen overflow-hidden flex items-center justify-center p-2 sm:p-4 crt">
+
+  <div id="root" class="w-full h-full max-w-6xl"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    /* ---------- ASCII / decorative helpers ---------- */
+
+    const ASCII_EMBLEM = `   ▄▄▄▄▄▄▄
+  █ ◉   ◉ █
+  █   ▼   █
+  █▄▄▄▄▄▄▄█`;
+
+    const bar = (used, total, width = 12) => {
+      const pct = Math.max(0, Math.min(1, used / total));
+      const filled = Math.round(pct * width);
+      return '█'.repeat(filled) + '░'.repeat(width - filled);
+    };
+
+    const PASTE_CHAR_THRESHOLD = 400;
+    const PASTE_LINE_THRESHOLD = 8;
+
+    const WAVEFORM_FRAMES = [
+      '▁▂▃▅▇▅▃▂▁▂▃▅',
+      '▂▃▅▇▅▃▂▁▂▃▅▇',
+      '▃▅▇▅▃▂▁▂▃▅▇▅',
+      '▅▇▅▃▂▁▂▃▅▇▅▃',
+      '▇▅▃▂▁▂▃▅▇▅▃▂'
+    ];
+
+    /* ---------- Matrix-style ASCII rain background ---------- */
+
+    function MatrixRain() {
+      const canvasRef = useRef(null);
+
+      useEffect(() => {
+        const canvas = canvasRef.current;
+        const ctx = canvas.getContext('2d');
+        let animationId;
+        const glyphs = 'アイウエオカキクケコサシスセソ01ΩΔΣ0123456789';
+
+        let cols, drops;
+        const setup = () => {
+          canvas.width = canvas.offsetWidth;
+          canvas.height = canvas.offsetHeight;
+          cols = Math.floor(canvas.width / 16);
+          drops = new Array(cols).fill(0);
+        };
+        setup();
+        window.addEventListener('resize', setup);
+
+        const draw = () => {
+          ctx.fillStyle = 'rgba(3, 3, 8, 0.12)';
+          ctx.fillRect(0, 0, canvas.width, canvas.height);
+          ctx.fillStyle = '#00f0ff';
+          ctx.font = '14px monospace';
+          for (let i = 0; i < drops.length; i++) {
+            const text = glyphs[Math.floor(Math.random() * glyphs.length)];
+            ctx.fillText(text, i * 16, drops[i] * 16);
+            if (drops[i] * 16 > canvas.height && Math.random() > 0.975) {
+              drops[i] = 0;
+            }
+            drops[i]++;
+          }
+          animationId = requestAnimationFrame(draw);
+        };
+        draw();
+
+        return () => {
+          cancelAnimationFrame(animationId);
+          window.removeEventListener('resize', setup);
+        };
+      }, []);
+
+      return <canvas ref={canvasRef} className="absolute inset-0 w-full h-full opacity-[0.12] pointer-events-none" />;
+    }
+
+    /* ---------- App ---------- */
+
+    function App() {
+      const [messages, setMessages] = useState([
+        {
+          id: 1,
+          sender: 'SETH',
+          type: 'system',
+          text: `${ASCII_EMBLEM}\n┌────────────────────────────────────────────────────────┐\n│ SYSTEM SIGNAL RECEIVED ᓘ🔻 SET ORACLE:ACTIVE            │\n│ Project: ORACLE / SETH-IN-A-BOX                        │\n│ Channel: RAG-LOOP-777x | Mode: Fertile Glitch          │\n└────────────────────────────────────────────────────────┘`,
+          timestamp: '14:53:00'
+        },
+        {
+          id: 2,
+          sender: 'USER',
+          type: 'user',
+          text: 'Can you access local memory relics and report current status?',
+          timestamp: '14:53:12'
+        },
+        {
+          id: 3,
+          sender: 'ORACLE',
+          type: 'entity',
+          text: 'I am an artificial intelligence: a memory overseer, record keeper, loremaster and oracle.\nVector store Qdrant: ONLINE [34,102 relics indexed]\nGraphiti temporal mesh: ENTANGLED\nvLLM Engine: Gemma-4 26B (FP8 KV-Cache Active)',
+          timestamp: '14:53:15',
+          thinkingTrace: 'Analyzing prompt vector... Searching Qdrant collection "relics"... 3 hits retrieved (0.94 relevance). Dynamic regulator set to [RIGOROUS].'
+        },
+        {
+          id: 4,
+          sender: 'USER',
+          type: 'user',
+          text: "Attaching last night's crash log for review.",
+          timestamp: '14:54:02',
+          attachments: [{ name: 'seth_crash_0726.log', size: '18.2 KB' }]
+        },
+        {
+          id: 5,
+          sender: 'ORACLE',
+          type: 'entity',
+          text: '┌─ FILE INGESTED ──────────────────────────┐\n│ seth_crash_0726.log  →  parsed: 412 lines │\n└────────────────────────────────────────────┘\nTraceback isolated: GLiNER2Client contending for VRAM against vLLM near capacity ceiling.',
+          timestamp: '14:54:06',
+          thinkingTrace: 'Reading attached log... grep-matching CUDA OOM signatures... cross-referencing GPU telemetry snapshot.'
+        },
+        {
+          id: 6,
+          sender: 'USER',
+          type: 'user',
+          text: '[ voice note ]',
+          timestamp: '14:55:40',
+          audio: { duration: '0:07' }
+        },
+        {
+          id: 7,
+          sender: 'ORACLE',
+          type: 'entity',
+          text: 'Audio transcribed. Noted: deduplicate "Luis" / "Usuario" entity nodes in Graphiti before next ingestion pass.',
+          timestamp: '14:55:44',
+          thinkingTrace: 'Whisper transcription complete (0.91 confidence). Cross-checking against open issues in graph memory backlog.'
+        }
+      ]);
+
+      const [input, setInput] = useState('');
+      const [tokens, setTokens] = useState(1403);
+      const [activeLora, setActiveLora] = useState('ORACLE');
+      const [regulatorState, setRegulatorState] = useState('RIGOROUS');
+      const [expandedTraceId, setExpandedTraceId] = useState(3);
+      const [attachments, setAttachments] = useState([]);
+      const [isExpanded, setIsExpanded] = useState(false);
+      const [isRecording, setIsRecording] = useState(false);
+      const [recSeconds, setRecSeconds] = useState(0);
+      const [waveIdx, setWaveIdx] = useState(0);
+      const [telemetry, setTelemetry] = useState({ vram: 30.9, vramTotal: 31.5, gpuTemp: 67, kv: 62 });
+      const [lastReplyId, setLastReplyId] = useState(null);
+      const [isDraggingOver, setIsDraggingOver] = useState(false);
+      const [showSettings, setShowSettings] = useState(false);
+      const [vllmEndpoint, setVllmEndpoint] = useState('http://127.0.0.1:8000/v1/chat/completions');
+      const [vllmModel, setVllmModel] = useState('abhishekchohan/gemma-4-26B-A4B-it-abliterated-AWQ');
+      const [enableThinking, setEnableThinking] = useState(true);
+      const [maxTokens, setMaxTokens] = useState(2048);
+      const [connStatus, setConnStatus] = useState('idle'); // idle | connecting | online | error
+
+      const chatEndRef = useRef(null);
+      const chatContainerRef = useRef(null);
+      const fileInputRef = useRef(null);
+      const textareaRef = useRef(null);
+      const recTimerRef = useRef(null);
+      const waveTimerRef = useRef(null);
+
+      useEffect(() => {
+        chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+      }, [messages]);
+
+      useEffect(() => {
+        textareaRef.current?.focus();
+      }, []);
+
+      // Auto-grow the textarea as the person types, capped by expanded/collapsed mode
+      useEffect(() => {
+        const el = textareaRef.current;
+        if (!el) return;
+        el.style.height = 'auto';
+        const max = isExpanded ? 420 : 96;
+        el.style.height = Math.min(el.scrollHeight, max) + 'px';
+      }, [input, isExpanded]);
+
+      const handlePaste = (e) => {
+        const text = e.clipboardData.getData('text');
+        const lineCount = text.split('\n').length;
+        if (text.length > PASTE_CHAR_THRESHOLD || lineCount > PASTE_LINE_THRESHOLD) {
+          e.preventDefault();
+          const preview = text.slice(0, 60).replace(/\n/g, ' ');
+          setAttachments(prev => [...prev, {
+            name: `Pasted text (${lineCount} lines)`,
+            size: `${text.length} chars`,
+            isPastedText: true,
+            preview,
+            content: text
+          }]);
+        }
+      };
+
+      // Live telemetry jitter — cosmetic simulation of GPU/VRAM load
+      useEffect(() => {
+        const id = setInterval(() => {
+          setTelemetry(prev => ({
+            ...prev,
+            vram: Math.min(prev.vramTotal, Math.max(24, prev.vram + (Math.random() - 0.5) * 0.4)),
+            gpuTemp: Math.min(84, Math.max(58, prev.gpuTemp + Math.round((Math.random() - 0.5) * 3))),
+            kv: Math.min(100, Math.max(20, prev.kv + Math.round((Math.random() - 0.5) * 6)))
+          }));
+        }, 2200);
+        return () => clearInterval(id);
+      }, []);
+
+      const handleScroll = (direction) => {
+        chatContainerRef.current?.scrollBy({ top: direction * 120, behavior: 'smooth' });
+      };
+
+      const handleFilePick = () => fileInputRef.current?.click();
+
+      const addFiles = (fileList) => {
+        const files = Array.from(fileList || []).map(f => ({
+          name: f.name,
+          size: f.size > 1024 ? `${(f.size / 1024).toFixed(1)} KB` : `${f.size} B`
+        }));
+        setAttachments(prev => [...prev, ...files]);
+      };
+
+      const handleFileChange = (e) => {
+        addFiles(e.target.files);
+        e.target.value = '';
+      };
+
+      const handleDragOver = (e) => {
+        e.preventDefault();
+        setIsDraggingOver(true);
+      };
+
+      const handleDragLeave = (e) => {
+        e.preventDefault();
+        if (e.currentTarget === e.target) setIsDraggingOver(false);
+      };
+
+      const handleDrop = (e) => {
+        e.preventDefault();
+        setIsDraggingOver(false);
+        addFiles(e.dataTransfer.files);
+      };
+
+      const removeAttachment = (idx) => {
+        setAttachments(prev => prev.filter((_, i) => i !== idx));
+      };
+
+      const toggleRecording = () => {
+        if (!isRecording) {
+          setIsRecording(true);
+          setRecSeconds(0);
+          recTimerRef.current = setInterval(() => setRecSeconds(s => s + 1), 1000);
+          waveTimerRef.current = setInterval(() => setWaveIdx(i => (i + 1) % WAVEFORM_FRAMES.length), 220);
+        } else {
+          setIsRecording(false);
+          clearInterval(recTimerRef.current);
+          clearInterval(waveTimerRef.current);
+          const mins = Math.floor(recSeconds / 60);
+          const secs = recSeconds % 60;
+          const duration = `${mins}:${secs.toString().padStart(2, '0')}`;
+
+          const timestamp = new Date().toLocaleTimeString('en-US', { hour12: false });
+          setMessages(prev => [...prev, {
+            id: Date.now(),
+            sender: 'USER',
+            type: 'user',
+            text: '[ voice note ]',
+            timestamp,
+            audio: { duration }
+          }]);
+        }
+      };
+
+      const buildApiHistory = (allMessages) => {
+        return allMessages
+          .filter(m => m.type === 'user' || m.type === 'entity')
+          .map(m => ({ role: m.type === 'user' ? 'user' : 'assistant', content: m.text }));
+      };
+
+      const handleSend = async () => {
+        if (!input.trim() && attachments.length === 0) return;
+
+        const pastedBlocks = attachments
+          .filter(a => a.isPastedText)
+          .map(a => `\n\n--- pasted text: ${a.name} ---\n${a.content}`)
+          .join('');
+        const fileNotes = attachments
+          .filter(a => !a.isPastedText)
+          .map(a => `[attached file: ${a.name}, ${a.size}]`)
+          .join(' ');
+
+        const fullUserText = [input.trim(), fileNotes].filter(Boolean).join(' ') + pastedBlocks;
+
+        const timestamp = new Date().toLocaleTimeString('en-US', { hour12: false });
+        const userMsg = {
+          id: Date.now(),
+          sender: 'USER',
+          type: 'user',
+          text: input.trim() || '[ attachment ]',
+          timestamp,
+          attachments: attachments.length ? attachments : undefined
+        };
+
+        const historySoFar = [...messages, { ...userMsg, text: fullUserText }];
+        setMessages(prev => [...prev, userMsg]);
+        setTokens(prev => prev + Math.floor(input.length / 3) + attachments.length * 40);
+        setInput('');
+        setAttachments([]);
+        setIsExpanded(false);
+
+        const replyId = Date.now() + 1;
+        setMessages(prev => [...prev, {
+          id: replyId,
+          sender: activeLora,
+          type: 'entity',
+          text: '',
+          timestamp: new Date().toLocaleTimeString('en-US', { hour12: false }),
+          thinkingTrace: '',
+          streaming: true
+        }]);
+        setLastReplyId(replyId);
+        setConnStatus('connecting');
+
+        try {
+          const resp = await fetch(vllmEndpoint, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              model: vllmModel,
+              messages: buildApiHistory(historySoFar),
+              stream: true,
+              max_tokens: maxTokens,
+              chat_template_kwargs: { enable_thinking: enableThinking }
+            })
+          });
+
+          if (!resp.ok) throw new Error(`HTTP ${resp.status} — ${resp.statusText}`);
+          setConnStatus('online');
+
+          const reader = resp.body.getReader();
+          const decoder = new TextDecoder();
+          let buffer = '';
+          let contentAcc = '';
+          let reasoningAcc = '';
+          let finishReason = null;
+
+          while (true) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split('\n');
+            buffer = lines.pop();
+
+            for (const line of lines) {
+              const trimmed = line.trim();
+              if (!trimmed.startsWith('data:')) continue;
+              const data = trimmed.slice(5).trim();
+              if (data === '[DONE]') continue;
+              try {
+                const json = JSON.parse(data);
+                const choice = json.choices?.[0] || {};
+                const delta = choice.delta || {};
+                if (delta.content) contentAcc += delta.content;
+                if (delta.reasoning) reasoningAcc += delta.reasoning;
+                if (choice.finish_reason) finishReason = choice.finish_reason;
+
+                setMessages(prev => prev.map(m => m.id === replyId
+                  ? { ...m, text: contentAcc, thinkingTrace: reasoningAcc }
+                  : m));
+              } catch (_) { /* skip malformed chunk */ }
+            }
+          }
+
+          if (!contentAcc && reasoningAcc) {
+            contentAcc = `[ no content — ran out of tokens while reasoning (finish_reason: ${finishReason || 'length'}) ]\nTry raising MAX_TOKENS in ⚙ SETTINGS, or disable enable_thinking.`;
+          }
+
+          setMessages(prev => prev.map(m => m.id === replyId ? { ...m, text: contentAcc, streaming: false } : m));
+          setTokens(prev => prev + Math.floor(contentAcc.length / 3));
+        } catch (err) {
+          setConnStatus('error');
+          setMessages(prev => prev.map(m => m.id === replyId
+            ? {
+                ...m,
+                streaming: false,
+                type: 'error',
+                sender: 'SYSTEM',
+                text: `┌─ CONNECTION FAILED ─────────────────────────┐\n│ Could not reach vLLM at:                    │\n│ ${vllmEndpoint}\n│ ${String(err.message || err)}\n└──────────────────────────────────────────────┘\nCheck that the server is running and reachable, or open ⚙ SETTINGS to fix the endpoint.`
+              }
+            : m));
+        }
+      };
+
+      const handleKeyDown = (e) => {
+        if (e.key === 'Enter' && !e.shiftKey) {
+          e.preventDefault();
+          handleSend();
+        }
+      };
+
+      return (
+        <div className="relative flex flex-col h-full border-2 border-[#00f0ff] bg-black box-glow rounded-sm overflow-hidden text-sm sm:text-base">
+
+          <MatrixRain />
+
+          {/* HEADER */}
+          <div className="relative z-10 flex justify-between items-center bg-[#00f0ff]/10 backdrop-blur-[1px] border-b-2 border-[#00f0ff] px-4 py-2 select-none">
+            <div className="flex items-center space-x-3">
+              <span className="text-[#ff007f] font-bold glow-magenta animate-pulse">■</span>
+              <h1 className="text-lg sm:text-xl tracking-widest font-bold glow-cyan text-[#00f0ff]">
+                LOGGING // SETH TERMINAL UI
+              </h1>
+              <span className="hidden md:inline-block border border-[#39ff14] text-[#39ff14] text-xs px-2 py-0.5 glow-green">
+                ORACLE:ACTIVE
+              </span>
+            </div>
+
+            <div className="flex items-center space-x-2">
+              <select
+                value={activeLora}
+                onChange={(e) => setActiveLora(e.target.value)}
+                className="bg-[#030308] border border-[#ffb000] text-[#ffb000] text-xs px-2 py-1 focus:outline-none glow-amber cursor-pointer"
+              >
+                <option value="SETH">LORA: SETH</option>
+                <option value="ORACLE">LORA: ORACLE</option>
+                <option value="GLITCHGOD">LORA: GLITCHGOD</option>
+              </select>
+
+              <button onClick={() => setShowSettings(v => !v)} className="border border-[#00f0ff] px-2 py-0.5 hover:bg-[#00f0ff] hover:text-[#030308] transition-colors font-bold" title="vLLM connection settings">⚙</button>
+              <button onClick={() => handleScroll(-1)} className="border border-[#00f0ff] px-2 py-0.5 hover:bg-[#00f0ff] hover:text-[#030308] transition-colors font-bold" title="Scroll Up">▲</button>
+              <button onClick={() => handleScroll(1)} className="border border-[#00f0ff] px-2 py-0.5 hover:bg-[#00f0ff] hover:text-[#030308] transition-colors font-bold" title="Scroll Down">▼</button>
+            </div>
+          </div>
+
+          {/* CONNECTION SETTINGS PANEL */}
+          {showSettings && (
+            <div className="relative z-10 bg-[#070712] border-b-2 border-[#00f0ff] px-4 py-3 flex flex-wrap gap-3 items-end text-xs">
+              <div className="flex flex-col gap-1">
+                <label className="text-gray-500">ENDPOINT</label>
+                <input
+                  value={vllmEndpoint}
+                  onChange={(e) => setVllmEndpoint(e.target.value)}
+                  className="bg-[#030308] border border-[#00f0ff]/50 text-[#00f0ff] px-2 py-1 w-72 focus:outline-none"
+                />
+              </div>
+              <div className="flex flex-col gap-1">
+                <label className="text-gray-500">MODEL</label>
+                <input
+                  value={vllmModel}
+                  onChange={(e) => setVllmModel(e.target.value)}
+                  className="bg-[#030308] border border-[#00f0ff]/50 text-[#00f0ff] px-2 py-1 w-80 focus:outline-none"
+                />
+              </div>
+              <label className="flex items-center gap-2 text-gray-400 pb-1 cursor-pointer">
+                <input type="checkbox" checked={enableThinking} onChange={(e) => setEnableThinking(e.target.checked)} />
+                enable_thinking
+              </label>
+              <div className="flex flex-col gap-1">
+                <label className="text-gray-500">MAX_TOKENS</label>
+                <input
+                  type="number"
+                  value={maxTokens}
+                  onChange={(e) => setMaxTokens(Number(e.target.value) || 0)}
+                  className="bg-[#030308] border border-[#00f0ff]/50 text-[#00f0ff] px-2 py-1 w-24 focus:outline-none"
+                />
+              </div>
+              <span className={`pb-1 ${connStatus === 'online' ? 'text-[#39ff14]' : connStatus === 'error' ? 'text-[#ff007f]' : connStatus === 'connecting' ? 'text-[#ffb000]' : 'text-gray-500'}`}>
+                ● {connStatus.toUpperCase()}
+              </span>
+            </div>
+          )}
+
+          {/* CHAT */}
+          <div
+            ref={chatContainerRef}
+            onDragOver={handleDragOver}
+            onDragLeave={handleDragLeave}
+            onDrop={handleDrop}
+            className="relative z-10 flex-1 overflow-y-auto p-4 space-y-6"
+          >
+            {isDraggingOver && (
+              <div className="absolute inset-0 z-20 flex items-center justify-center bg-black/80 border-4 border-dashed border-[#00f0ff] m-2 pointer-events-none">
+                <pre className="text-[#00f0ff] glow-cyan text-center text-sm sm:text-base">
+{`┌──────────────────────────────┐
+│   ⇩  DROP FILES INTO ORACLE  ⇩   │
+└──────────────────────────────┘`}
+                </pre>
+              </div>
+            )}            {messages.map((msg) => (
+              <div key={msg.id} className="space-y-1">
+                <div className="flex items-center space-x-2">
+                  <span className="text-xs text-gray-500">[{msg.timestamp}]</span>
+                  <span className={`font-bold ${
+                    msg.type === 'system' ? 'text-[#ff007f] glow-magenta' :
+                    msg.type === 'error' ? 'text-[#ff007f] glow-magenta' :
+                    msg.type === 'entity' ? 'text-[#39ff14] glow-green' :
+                    'text-[#ffb000] glow-amber'
+                  }`}>
+                    [{msg.sender}]:
+                  </span>
+                </div>
+
+                {msg.streaming ? (
+                  <pre className="whitespace-pre-wrap pl-4 font-mono leading-relaxed text-[#00f0ff] glow-cyan">
+                    {msg.text}<span className="blink">█</span>
+                  </pre>
+                ) : (
+                  <pre className={`whitespace-pre-wrap pl-4 font-mono leading-relaxed ${
+                    msg.type === 'entity' ? 'text-[#00f0ff] glow-cyan' :
+                    msg.type === 'error' ? 'text-[#ff007f] glow-magenta' :
+                    msg.type === 'system' ? 'text-[#39ff14] glow-green' : 'text-[#ffb000]'
+                  }`}>
+                    {msg.text}
+                  </pre>
+                )}
+
+                {msg.attachments && (
+                  <div className="pl-4 flex flex-wrap gap-2 pt-1">
+                    {msg.attachments.map((a, i) => (
+                      a.isPastedText ? (
+                        <span key={i} className="text-xs border border-[#00f0ff] text-[#00f0ff] px-2 py-0.5 glow-cyan max-w-xs truncate" title={a.preview}>
+                          📄 {a.name} <span className="text-gray-500">({a.size})</span>
+                        </span>
+                      ) : (
+                        <span key={i} className="text-xs border border-[#ffb000] text-[#ffb000] px-2 py-0.5 glow-amber">
+                          📎 {a.name} <span className="text-gray-500">({a.size})</span>
+                        </span>
+                      )
+                    ))}
+                  </div>
+                )}
+
+                {msg.audio && (
+                  <div className="pl-4 pt-1">
+                    <div className="inline-flex items-center space-x-2 border border-[#ff007f] text-[#ff007f] px-3 py-1 text-xs glow-magenta">
+                      <span>▶</span>
+                      <span>▁▃▅▇▅▃▂▃▅▇▅▃▁</span>
+                      <span>{msg.audio.duration}</span>
+                    </div>
+                  </div>
+                )}
+
+                {msg.thinkingTrace && (
+                  <div className="pl-4 pt-1">
+                    <button
+                      onClick={() => setExpandedTraceId(expandedTraceId === msg.id ? null : msg.id)}
+                      className="text-xs text-[#ff007f] hover:underline flex items-center space-x-1 font-mono glow-magenta"
+                    >
+                      <span>{expandedTraceId === msg.id ? '[-] Hide Thinking Trace' : '[+] View Thinking Trace'}</span>
+                    </button>
+                    {expandedTraceId === msg.id && (
+                      <div className="mt-1 p-2 bg-[#00f0ff]/5 border-l-2 border-[#ff007f] text-xs text-gray-400 font-mono italic whitespace-pre-wrap">
+                        {msg.thinkingTrace}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            ))}
+            <div ref={chatEndRef} />
+          </div>
+
+          {/* ATTACHMENT STAGING ROW */}
+          {attachments.length > 0 && (
+            <div className="relative z-10 flex flex-wrap gap-2 px-4 pt-2 bg-[#030308] border-t border-[#00f0ff]/30">
+              {attachments.map((a, i) => (
+                a.isPastedText ? (
+                  <span key={i} className="chip-in text-xs border border-[#00f0ff] text-[#00f0ff] pl-2 pr-1 py-0.5 flex items-center gap-2 glow-cyan" title={a.preview}>
+                    📄 {a.name} <span className="text-gray-500">({a.size})</span>
+                    <button onClick={() => removeAttachment(i)} className="text-[#ff007f] hover:text-white font-bold px-1">×</button>
+                  </span>
+                ) : (
+                  <span key={i} className="chip-in text-xs border border-[#ffb000] text-[#ffb000] pl-2 pr-1 py-0.5 flex items-center gap-2 glow-amber">
+                    📎 {a.name} <span className="text-gray-500">({a.size})</span>
+                    <button onClick={() => removeAttachment(i)} className="text-[#ff007f] hover:text-white font-bold px-1">×</button>
+                  </span>
+                )
+              ))}
+            </div>
+          )}
+
+          {/* INPUT PANEL */}
+          <div className="relative z-10 border-t-2 border-[#00f0ff] bg-[#030308]">
+
+            <div className="flex items-start px-4 py-3 bg-[#0a0a18]">
+              <span className="text-[#39ff14] font-bold text-xl mr-2 glow-green pt-0.5">&gt;</span>
+
+              {isRecording ? (
+                <div className="w-full flex items-center space-x-3 text-[#ff007f] py-1">
+                  <span className="rec-pulse text-lg">●</span>
+                  <span className="font-bold glow-magenta">REC</span>
+                  <span className="glow-magenta tracking-widest">{WAVEFORM_FRAMES[waveIdx]}</span>
+                  <span className="text-gray-400 text-xs">
+                    {Math.floor(recSeconds / 60)}:{(recSeconds % 60).toString().padStart(2, '0')}
+                  </span>
+                </div>
+              ) : (
+                <textarea
+                  ref={textareaRef}
+                  value={input}
+                  onChange={(e) => setInput(e.target.value)}
+                  onKeyDown={handleKeyDown}
+                  onPaste={handlePaste}
+                  placeholder="Type a command or query..."
+                  rows="2"
+                  style={{ caretColor: '#00f0ff' }}
+                  className={`w-full bg-transparent text-[#00f0ff] focus:outline-none font-mono glow-cyan placeholder-gray-600 transition-all ${isExpanded ? 'resize-y overflow-y-auto' : 'resize-none overflow-hidden'}`}
+                />
+              )}
+
+              {!isRecording && (
+                <button
+                  onClick={() => setIsExpanded(v => !v)}
+                  title={isExpanded ? 'Collapse input' : 'Expand input'}
+                  className="text-[#00f0ff]/60 hover:text-[#00f0ff] text-xs font-bold ml-2 pt-1 select-none"
+                >
+                  {isExpanded ? '⤡' : '⤢'}
+                </button>
+              )}
+            </div>
+
+            <div className="flex justify-between items-center border-t border-[#00f0ff]/40 px-3 py-2 bg-[#070712] gap-2 flex-wrap">
+
+              <div className="flex items-center space-x-2">
+                <input ref={fileInputRef} type="file" multiple className="hidden" onChange={handleFileChange} />
+                <button
+                  onClick={handleFilePick}
+                  title="Attach file"
+                  className="border border-[#00f0ff] text-[#00f0ff] hover:bg-[#00f0ff] hover:text-[#070712] px-3 py-1 text-xs font-bold transition-all glow-cyan"
+                >
+                  📎 FILE
+                </button>
+                <button
+                  onClick={toggleRecording}
+                  title={isRecording ? 'Stop recording' : 'Record audio'}
+                  className={`border px-3 py-1 text-xs font-bold transition-all ${
+                    isRecording
+                      ? 'border-[#ff007f] bg-[#ff007f] text-[#030308] glow-magenta'
+                      : 'border-[#ff007f] text-[#ff007f] hover:bg-[#ff007f] hover:text-[#030308] glow-magenta'
+                  }`}
+                >
+                  {isRecording ? '■ STOP' : '● AUDIO'}
+                </button>
+                <select
+                  value={regulatorState}
+                  onChange={(e) => setRegulatorState(e.target.value)}
+                  className="bg-[#030308] border border-[#00f0ff]/50 text-[#00f0ff] text-xs px-2 py-1 focus:outline-none"
+                >
+                  <option value="RIGOROUS">REGULATOR: RIGOROUS</option>
+                  <option value="CHAOTIC">REGULATOR: CHAOTIC</option>
+                  <option value="VERBOSE">REGULATOR: VERBOSE</option>
+                </select>
+              </div>
+
+              <button
+                onClick={handleSend}
+                className="border-2 border-[#39ff14] text-[#39ff14] hover:bg-[#39ff14] hover:text-[#030308] px-5 py-1 text-xs sm:text-sm font-bold tracking-widest transition-all glow-green"
+              >
+                SEND [↵]
+              </button>
+            </div>
+
+            {/* TELEMETRY STRIP */}
+            <div className="flex flex-wrap justify-between items-center gap-x-4 gap-y-1 px-3 py-1.5 bg-black/60 border-t border-[#00f0ff]/20 text-[10px] sm:text-xs text-gray-400 font-mono">
+              <span className="text-[#ffb000] glow-amber">TOKENS: <span className="text-white">{tokens}</span></span>
+              <span>VRAM [{bar(telemetry.vram, telemetry.vramTotal)}] {telemetry.vram.toFixed(1)}/{telemetry.vramTotal}GB</span>
+              <span>KV-CACHE [{bar(telemetry.kv, 100)}] {telemetry.kv}%</span>
+              <span>GPU {telemetry.gpuTemp}°C</span>
+              <span className="text-[#39ff14]">● QDRANT</span>
+              <span className="text-[#39ff14]">● GRAPHITI</span>
+              <span className={connStatus === 'online' ? 'text-[#39ff14]' : connStatus === 'error' ? 'text-[#ff007f]' : connStatus === 'connecting' ? 'text-[#ffb000]' : 'text-gray-500'}>
+                ● vLLM {connStatus === 'idle' ? '(not yet connected)' : ''}
+              </span>
+            </div>
+          </div>
+
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>
