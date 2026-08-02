@@ -2061,6 +2061,19 @@ class _PrivateNetworkAccessMiddleware(BaseHTTPMiddleware):
         return response
 
 
+class _SuppressNoisyAccessLogFilter(logging.Filter):
+    """uvicorn.access logs every single request unconditionally, and
+    the_oracle.html's telemetry strip polls GET /api/status every few
+    seconds -- left alone, that drowns out everything actually worth seeing
+    (POST /api/chat, POST /api/register, errors). Drops just the configured
+    noisy paths; anything else still comes through normally."""
+    NOISY_SUBSTRINGS = ("GET /api/status",)
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        return not any(noisy in message for noisy in self.NOISY_SUBSTRINGS)
+
+
 class SethAPIBot(SethChatBot):
     """Bridges SethChatBot's tool-calling brain to an HTTP/SSE surface via
     FastAPI. This is the direct replacement for SethTelegramBot: same
@@ -2472,6 +2485,7 @@ class SethAPIBot(SethChatBot):
 
     def run(self):
         logging.info(f"🚀 [SETH API] Starting on http://{self.env.api_host}:{self.env.api_port}")
+        logging.getLogger("uvicorn.access").addFilter(_SuppressNoisyAccessLogFilter())
         # log_config=None: keep the coloredlogs setup from SethLoggerInit instead
         # of letting uvicorn install its own logging config over it.
         uvicorn.run(self.app, host=self.env.api_host, port=self.env.api_port, log_config=None)
