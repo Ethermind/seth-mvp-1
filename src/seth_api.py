@@ -411,6 +411,10 @@ class SethToolsManager:
             )
             logging.info(f"🛠️ [TOOLS MANAGER] Auto-registered tool: '{name}'")
 
+    def register_instances(self, instances: list[Any]):
+        for instance in instances:
+            self.register_instance(instance)
+
     def as_vllm_format(self) -> list:
         """
         Returns the standard OpenAI/vLLM format for tool definition lists.
@@ -2507,8 +2511,7 @@ def main():
     graph_query_tool = SethGraphQueryTool(env=env)
 
     tools_manager = SethToolsManager()
-    for tool_instance in (search_tool, memory_tool, inspector_tool, image_tool, speech_tool, graph_query_tool):
-        tools_manager.register_instance(tool_instance)
+    tools_manager.register_instances([search_tool, memory_tool, inspector_tool, image_tool, speech_tool, graph_query_tool])
 
     vllm_client = AsyncOpenAI(base_url=env.vllm_url, api_key=env.api_key)
     whisper_client = AsyncOpenAI(base_url=env.whisper_url, api_key=env.api_key)
