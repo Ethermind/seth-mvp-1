@@ -232,7 +232,7 @@
       const [isRecording, setIsRecording] = useState(false);
       const [recSeconds, setRecSeconds] = useState(0);
       const [waveIdx, setWaveIdx] = useState(0);
-      const [telemetry, setTelemetry] = useState({ vram: 0, vramTotal: 0, qdrant: 'unknown', graphiti: 'unknown', vllm: 'unknown' });
+      const [telemetry, setTelemetry] = useState({ vram: [], qdrant: 'unknown', graphiti: 'unknown', vllm: 'unknown', whisper: 'unknown' });
       const [lastReplyId, setLastReplyId] = useState(null);
       const [isDraggingOver, setIsDraggingOver] = useState(false);
       const [showSettings, setShowSettings] = useState(true);
@@ -298,15 +298,15 @@
             const data = await resp.json();
             if (cancelled) return;
             setTelemetry({
-              vram: data.vram?.used_gb ?? 0,
-              vramTotal: data.vram?.total_gb ?? 0,
+              vram: data.vram || [], // array of {index, name, used_gb, total_gb}, one per physical GPU
               qdrant: data.qdrant || 'unknown',
               graphiti: data.neo4j_graphiti || 'unknown',
-              vllm: data.vllm || 'unknown'
+              vllm: data.vllm || 'unknown',
+              whisper: data.whisper || 'unknown'
             });
           } catch (_) {
             if (cancelled) return;
-            setTelemetry(prev => ({ ...prev, qdrant: 'unreachable', graphiti: 'unreachable', vllm: 'unreachable' }));
+            setTelemetry(prev => ({ ...prev, qdrant: 'unreachable', graphiti: 'unreachable', vllm: 'unreachable', whisper: 'unreachable' }));
           }
         };
 
@@ -928,13 +928,15 @@
             {/* TELEMETRY STRIP */}
             <div className="flex flex-wrap justify-between items-center gap-x-4 gap-y-1 px-3 py-1.5 bg-black/60 border-t border-[#00f0ff]/20 text-[10px] sm:text-xs text-gray-400 font-mono">
               <span className="text-[#ffb000] glow-amber">TOKENS: <span className="text-white">{tokens}</span></span>
-              <span>VRAM [{bar(telemetry.vram, telemetry.vramTotal || 1)}] {telemetry.vram.toFixed(1)}/{telemetry.vramTotal.toFixed(1)}GB</span>
+              {telemetry.vram.map((gpu) => (
+                <span key={gpu.index} title={gpu.name}>
+                  VRAM{gpu.index} [{bar(gpu.used_gb, gpu.total_gb || 1)}] {gpu.used_gb.toFixed(1)}/{gpu.total_gb.toFixed(1)}GB
+                </span>
+              ))}
               <span className={dotColor(telemetry.qdrant)}>● QDRANT</span>
               <span className={dotColor(telemetry.graphiti)}>● GRAPHITI</span>
               <span className={dotColor(telemetry.vllm)}>● vLLM</span>
-              <span className={connStatus === 'online' ? 'text-[#39ff14]' : connStatus === 'error' ? 'text-[#ff007f]' : connStatus === 'connecting' ? 'text-[#ffb000]' : 'text-gray-500'}>
-                ● CHAT {connStatus === 'idle' ? '(not yet connected)' : connStatus.toUpperCase()}
-              </span>
+              <span className={dotColor(telemetry.whisper)}>● WHISPER</span>
             </div>
           </div>
 

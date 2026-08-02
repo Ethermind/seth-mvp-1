@@ -2452,13 +2452,31 @@ class SethAPIBot(SethChatBot):
     # -------------------------------------------------------- telemetry --
 
     async def _collect_status(self) -> dict:
-        status: dict[str, Any] = {"vllm": "unknown", "qdrant": "unknown", "neo4j_graphiti": "unknown", "vram": None}
+        status: dict[str, Any] = {
+            "vllm": "unknown",
+            "whisper": "unknown",
+            "qdrant": "unknown",
+            "neo4j_graphiti": "unknown",
+            "vram": None,
+        }
 
         try:
             await asyncio.wait_for(self.client.models.list(), timeout=3.0)
             status["vllm"] = "online"
         except Exception as e:
             status["vllm"] = f"offline ({e})"
+
+        # faster-whisper-server's exact HTTP surface beyond /v1/audio/transcriptions
+        # isn't guaranteed (unlike vLLM, which is known to implement /v1/models
+        # properly), so this is a generic "does anything answer" probe instead of
+        # a semantic one: any HTTP response -- even a 404 -- proves the process is
+        # up and listening. Only a connection-level failure counts as offline.
+        try:
+            async with httpx.AsyncClient(timeout=3.0) as hc:
+                await hc.get(self.env.whisper_url)
+            status["whisper"] = "online"
+        except Exception as e:
+            status["whisper"] = f"offline ({e})"
 
         # Lightweight HTTP probe instead of pulling in a qdrant-client dependency
         # just for a healthcheck -- mem0 already owns the real client.
@@ -2473,17 +2491,58 @@ class SethAPIBot(SethChatBot):
         # build_indices_and_constraints() call during startup warm-up.
         status["neo4j_graphiti"] = "online" if GraphitiClientSingleton._instance is not None else "not_initialized"
 
+        status["vram"] = await self._probe_vram()
+
+        return status
+
+    async def _probe_vram(self) -> list[dict] | None:
+        """Shells out to nvidia-smi instead of torch.cuda.mem_get_info(): the
+        latter only reports whatever device index THIS process's own CUDA
+        context considers "current", which can silently disagree with which
+        physical GPU vLLM (a separate process) is actually using once
+        CUDA_VISIBLE_DEVICES enters the picture -- exactly the setup here,
+        with the RTX 5090 as index 0 and the RTX 3050 as index 1. nvidia-smi
+        enumerates every physical GPU directly via NVML, independent of any
+        single process's device remapping, so it can't get that wrong."""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "nvidia-smi",
+                "--query-gpu=index,name,memory.used,memory.total",
+                "--format=csv,noheader,nounits",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=3.0)
+            gpus = []
+            for line in stdout.decode().strip().splitlines():
+                idx, name, used_mib, total_mib = (p.strip() for p in line.split(","))
+                gpus.append({
+                    "index": int(idx),
+                    "name": name,
+                    "used_gb": round(float(used_mib) / 1024, 2),
+                    "total_gb": round(float(total_mib) / 1024, 2),
+                })
+            if gpus:
+                return gpus
+        except Exception as e:
+            logging.debug(f"nvidia-smi VRAM probe failed, falling back to torch: {e}")
+
+        # Fallback if nvidia-smi isn't on PATH: at least report whatever device
+        # this process's own CUDA context sees. Less trustworthy in a multi-GPU
+        # setup (see docstring above), but better than nothing.
         try:
             if torch.cuda.is_available():
                 free_bytes, total_bytes = torch.cuda.mem_get_info()
-                status["vram"] = {
+                return [{
+                    "index": torch.cuda.current_device(),
+                    "name": torch.cuda.get_device_name(),
                     "used_gb": round((total_bytes - free_bytes) / (1024 ** 3), 2),
                     "total_gb": round(total_bytes / (1024 ** 3), 2),
-                }
+                }]
         except Exception as e:
-            logging.debug(f"VRAM probe failed: {e}")
+            logging.debug(f"torch VRAM fallback also failed: {e}")
 
-        return status
+        return None
 
     # -------------------------------------------------------------- run --
 
