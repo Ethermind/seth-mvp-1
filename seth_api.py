@@ -76,6 +76,7 @@ from graphiti_core.llm_client.gliner2_client import GLiNER2Client
 import uvicorn
 from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -1208,6 +1209,7 @@ class GraphitiClientSingleton:
                 cls._instance = graphiti
 
         return cls._instance
+    
 
 
 class SethGraphMemory:
@@ -1263,6 +1265,7 @@ class SethGraphQueryTool:
         except Exception as e:
             logging.warning(f"⚠️ [GRAPHITI] Error in query_relationship_graph: {e}")
             return "Graph query failed (non-critical). Notify the user that the graph is temporarily unavailable."
+        
 
 
 @dataclass(slots=True)
@@ -2034,6 +2037,30 @@ class RegisterRequest(BaseModel):
     token: str
 
 
+class _PrivateNetworkAccessMiddleware(BaseHTTPMiddleware):
+    """Chromium browsers (Chrome/Edge/Brave/...) increasingly gate any request
+    from a page's origin to a loopback/private address (this API, on
+    127.0.0.1) behind an extra check beyond normal CORS -- first as
+    "Private Network Access" (a CORS preflight requiring the response to
+    include Access-Control-Allow-Private-Network: true) and, from Chrome 142
+    (Oct 2025) onward, as "Local Network Access", a native permission prompt
+    the browser shows the user instead.
+
+    Starlette's CORSMiddleware doesn't add that header on its own, so this
+    echoes it back whenever the browser's preflight asks for it -- this is
+    enough to satisfy the older PNA check some Chromium builds still use.
+    It does NOT bypass the newer LNA permission prompt (that one is a
+    browser-side gate only the user can grant) -- see the note in
+    the_oracle.html / the project docs about serving the page over
+    http://localhost instead of opening it as a file:// URL, which is what
+    actually determines whether Chrome shows that prompt correctly."""
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+        if request.headers.get("access-control-request-private-network") == "true":
+            response.headers["Access-Control-Allow-Private-Network"] = "true"
+        return response
+
+
 class SethAPIBot(SethChatBot):
     """Bridges SethChatBot's tool-calling brain to an HTTP/SSE surface via
     FastAPI. This is the direct replacement for SethTelegramBot: same
@@ -2081,6 +2108,11 @@ class SethAPIBot(SethChatBot):
             allow_methods=["*"],
             allow_headers=["*"],
         )
+        # Added AFTER CORSMiddleware on purpose: Starlette wraps middleware in
+        # reverse registration order, so this one ends up outermost and gets
+        # a chance to stamp the extra header onto whatever CORSMiddleware
+        # already produced (including its own preflight response).
+        app.add_middleware(_PrivateNetworkAccessMiddleware)
 
         os.makedirs(self.env.storage_images_dir, exist_ok=True)
         os.makedirs(self.env.storage_audio_dir, exist_ok=True)
