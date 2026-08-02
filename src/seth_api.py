@@ -47,6 +47,7 @@ from typing import (
     get_origin,
     get_type_hints,
 )
+from urllib.parse import urlsplit
 from uuid import UUID, uuid4
 
 import coloredlogs
@@ -2466,17 +2467,13 @@ class SethAPIBot(SethChatBot):
         except Exception as e:
             status["vllm"] = f"offline ({e})"
 
-        # faster-whisper-server's exact HTTP surface beyond /v1/audio/transcriptions
-        # isn't guaranteed (unlike vLLM, which is known to implement /v1/models
-        # properly), so this is a generic "does anything answer" probe instead of
-        # a semantic one: any HTTP response -- even a 404 -- proves the process is
-        # up and listening. Only a connection-level failure counts as offline.
-        try:
-            async with httpx.AsyncClient(timeout=3.0) as hc:
-                await hc.get(self.env.whisper_url)
-            status["whisper"] = "online"
-        except Exception as e:
-            status["whisper"] = f"offline ({e})"
+        # A GET here (even to a route that 404s) still shows up as a log line
+        # in faster-whisper-server's own access log -- and at one probe every
+        # few seconds, that adds up to constant noise on a server we don't
+        # control the logging config of. A raw TCP connect-and-close never
+        # reaches that server's HTTP layer at all, so nothing gets logged
+        # there; it just confirms something is listening on that port.
+        status["whisper"] = await self._probe_tcp_reachable(self.env.whisper_url)
 
         # Lightweight HTTP probe instead of pulling in a qdrant-client dependency
         # just for a healthcheck -- mem0 already owns the real client.
@@ -2494,6 +2491,29 @@ class SethAPIBot(SethChatBot):
         status["vram"] = await self._probe_vram()
 
         return status
+
+    @staticmethod
+    async def _probe_tcp_reachable(url: str, timeout: float = 3.0) -> str:
+        """Confirms a service is alive with a bare TCP connect-and-close --
+        no HTTP request is ever sent, so (unlike httpx.get) this never shows
+        up in the target's own access log. Good enough for "is the process
+        up"; we don't need a semantic API check for every dependency, and for
+        one like faster-whisper-server whose exact HTTP surface beyond
+        /v1/audio/transcriptions isn't guaranteed, this is also more honest
+        than probing a route that may or may not exist."""
+        parsed = urlsplit(url)
+        host = parsed.hostname or "localhost"
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        try:
+            reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=timeout)
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass  # best-effort cleanup, the reachability check already succeeded
+            return "online"
+        except Exception as e:
+            return f"offline ({e})"
 
     async def _probe_vram(self) -> list[dict] | None:
         """Shells out to nvidia-smi instead of torch.cuda.mem_get_info(): the
