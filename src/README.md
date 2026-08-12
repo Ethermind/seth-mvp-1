@@ -1,63 +1,35 @@
-# 📟 SETH Terminal UI // Project Oracle
+# 📟 SETH-IN-A-BOX // Terminal UI, Telegram & REST API
 
-![Status](https://img.shields.io/badge/status-Phase%201%20Sandbox-orange)
-![Stack](https://img.shields.io/badge/stack-React%20%2B%20Tailwind-blue)
+![Status](https://img.shields.io/badge/status-Phase%202%20Multi--Interface-orange)
+![Stack](https://img.shields.io/badge/stack-FastAPI%20%2B%20SSE%20%2B%20Telegram%20%2B%20React%20CRT-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
-> **"Glitchnology will outlive biology."**
-> *A lightweight, local, retro-cyberpunk control center and oracle interface built for the SETH-IN-A-BOX ecosystem.*
+> **"Glitchnology will outlive biology."**  
+> *A unified local control center, telemetry engine, and oracle interface for the SETH architecture.*
 
 ---
 
 ## 🔮 Project Vision
 
-**SETH Terminal UI** is the next-generation replacement and companion for standard chat interfaces (such as Telegram). Built upon the premise of *glitch alchemy*, it merges the visual aesthetic of 80s/90s BBS/CRT terminals with the power of a modern web/desktop application featuring direct local system access.
+**SETH-IN-A-BOX** is evolving into a decoupled, multi-interface architecture. Maintaining the core *glitch alchemy* philosophy and retro BBS/CRT 80s/90s aesthetic, it allows seamless interaction with the same central "brain" across multiple channels:
 
-Designed not to obscure system "noise," memory operations, or internal reasoning, but rather to showcase and interact with them in real time.
+1. **`the_oracle.html` (Web Terminal UI):** A retro-cyberpunk rich-text local control surface featuring real-time telemetry, token-by-token thinking trace visualization, and RAG memory inspection.
+2. **`seth_telegram.py` (Telegram Bot):** A lightweight conversational interface for remote access and mobile interaction.
+3. **`seth_api.py` (FastAPI / SSE Service):** An HTTP REST and Server-Sent Events (SSE) gateway exposing the core engine pipeline to the Web UI and external clients.
 
-> **Relationship to Seth:** This is a companion frontend for the [Seth Telegram bot](#) — same backend, same brain, different face. Seth keeps running on Telegram; this UI is an alternative local control surface for the same core.
+All interfaces share the exact same memory subsystem, dynamic regulator state, and tool execution capabilities.
 
 ---
 
-## 📸 Preview
+## 📂 Project Structure
 
-> _Add a screenshot or short GIF of the Phase 1 sandbox here — this project is 90% visual, so show it before you tell it._
-
+```text
+.
+├── the_oracle.html     # Standalone retro CRT Web UI (React 18 CDN + Tailwind + Canvas)
+├── seth_api.py         # FastAPI backend + SSE Streaming & ContextVar isolation
+├── seth_telegram.py    # Telegram Bot adapter (Remote interface)
+└── README.md           # Ecosystem documentation
 ```
-[ screenshot / demo.gif placeholder ]
-```
-
----
-
-## ⚡ Key Features
-
-### 🎨 1. CRT Aesthetics & ASCII Framing
-* **CRT Scanline Engine:** Cathode-ray tube screen simulation featuring scanlines, phosphor glow (green, cyan, amber), and a blinking cursor `> █`.
-* **ASCII Message Frames:** Dynamic Unicode/ASCII borders distinguishing entity responses, user inputs, and system events.
-* **"LOGGING" Header:** Title bar featuring direct page-scroll controls and active session status.
-
-### 🧠 2. Oracle & Real-Time Telemetry
-* **Thinking Trace Stream:** Interactive collapsible panel to observe the model's internal reasoning (`enable_thinking`) token by token.
-* **Dynamic Regulator:** Visual indicators for the system's operational state (*Rigorous*, *Chaotic*, *Verbose*) with automatic palette shifting based on active vibes.
-* **RAG Relic Inspector:** Deep-dive inspection into vector memory fragments retrieved from Qdrant/Graphiti, formatted as ASCII scrolls.
-* **Hot-Swap Identity Module:** Quick selector for identity masks or LoRA adapters (`SETH`, `ORACLE`, `GLITCHGOD`, etc.).
-
-### 📁 3. Power Features
-* **Native Attachment Manager:** Drag-and-drop interface for local files, scripts, and audio clips.
-* **Bidirectional Streaming:** Low-latency WebSockets/SSE communication with the local backend.
-* **Context Monitoring:** Real-time token usage counter and KV-cache utilization indicator (up to 131K context).
-
----
-
-## 🛠️ Tech Stack & Roadmap
-
-Development is executed across three progressive phases to ensure rapid prototyping and production stability:
-
-| Phase | Focus | Stack | Purpose | Status |
-| :--- | :--- | :--- | :--- | :--- |
-| **Phase 1** | Single-File Sandbox | `index.html`, React 18 (CDN), Tailwind CSS | Complete visual prototyping in a single standalone executable file with zero dependencies. | - [x] In progress |
-| **Phase 2** | Production Web App | React 19, TypeScript, Vite, WebSockets | Component modularization, strict API tool schemas, and SSE streaming. | - [ ] Planned |
-| **Phase 3** | Native Desktop Shell | Tauri v2 (Rust + Webview) | Low-footprint desktop packaging (<50MB RAM), filesystem integration, and global hotkeys. | - [ ] Planned |
 
 ---
 
@@ -65,65 +37,125 @@ Development is executed across three progressive phases to ensure rapid prototyp
 
 ```mermaid
 flowchart TB
-    UI["SETH TERMINAL UI<br/>(React 18/19 + TypeScript + Tailwind + CRT Canvas)"]
-    WS["WebSocket / SSE Protocol"]
-    BACKEND["SETH CORE BACKEND"]
-    VLLM["vLLM (Gemma-4)"]
-    MEM0["Mem0 / Qdrant"]
-    GRAPHITI["Graphiti / Neo4j"]
+    subgraph Interface Adapters
+        WEB["the_oracle.html<br/>(Retro CRT Web UI)"]
+        TG["seth_telegram.py<br/>(Telegram Bot)"]
+    end
 
-    UI --> WS --> BACKEND
-    BACKEND --> VLLM
-    BACKEND --> MEM0
-    BACKEND --> GRAPHITI
+    subgraph API / Transport Layer
+        API["seth_api.py<br/>(FastAPI + SSE Stream / ContextVar)"]
+    end
+
+    subgraph Unified Core (Planned: seth_core)
+        CORE["SETH CORE ENGINE<br/>(State Manager, Dynamic Regulator, Tools)"]
+    end
+
+    subgraph AI Infrastructure
+        VLLM["vLLM / SGLang Engine"]
+        MEM0["Mem0 + Qdrant"]
+        GRAPH["Graphiti + Neo4j"]
+    end
+
+    WEB -- "HTTP REST / SSE" --> API
+    TG -- "Direct / HTTP Proxy" --> API
+    API --> CORE
+    CORE --> VLLM
+    CORE --> MEM0
+    CORE --> GRAPH
 ```
 
 ---
 
-## ✅ Prerequisites
+## 🛠️ Current State & Key Components
 
-Phase 1 itself is a zero-dependency static file, but for the UI to actually *do* anything, the **SETH CORE backend** needs to be up and reachable:
+### 🎨 1. Web Terminal UI (`the_oracle.html`)
+* **CRT Scanline Engine:** Cathode-Ray Tube screen simulation featuring scanlines, phosphor glow customization (green, cyan, amber), and blinking cursor `> █`.
+* **Telemetry & Thinking Trace:** Collapsible panel for inspecting the model's internal reasoning process token-by-token via SSE.
+* **Dynamic Regulator & Vibe Palettes:** Automatic UI color palette shifts reflecting the operational state (*Rigorous*, *Chaotic*, *Verbose*).
+* **RAG Relic Inspector:** ASCII-formatted scroll view for deep inspection of vector memory fragments retrieved from Qdrant/Graphiti.
 
-* Seth backend running (vLLM server, Mem0/Qdrant, Graphiti/Neo4j) — see the main [Seth project](#) for setup.
-* Backend WebSocket/SSE endpoint exposed on the expected local port.
-* A modern browser with JavaScript enabled (Chrome/Firefox/Edge, last 2 versions).
+### ⚡ 2. Backend REST / SSE API (`seth_api.py`)
+* **Event Streaming (`ask_stream`):** Continuous emission of reasoning traces, content chunks, and tool execution progress using `ServerSentEvents`.
+* **Context Isolation (`ContextVar`):** Strict request-level isolation of user IDs (`current_user_id`) to prevent data cross-contamination during concurrent streaming.
+* **State & Short-Term Memory:** Granular JSON/JSONL persistence per user ID (`history_<user_id>.jsonl` and `seth_state_<user_id>.json`).
 
-Without the backend running, the terminal will load but won't connect to a live model or memory store.
+### 📱 3. Telegram Bot Adapter (`seth_telegram.py`)
+* **Remote Access:** Conversational adapter tailored for on-the-go interaction.
+* **Tool Integration:** Direct access to local system execution tools and quick system commands.
 
 ---
 
-## 🚀 Quick Start (Phase 1: Single-File Sandbox)
+## 🚀 Technical Roadmap for Optimal Concurrency
 
-No Node.js, `npm`, or complex installation required for the frontend itself.
+To run both **Telegram** and the **Web UI (`the_oracle.html`)** concurrently without VRAM collisions on local GPUs (e.g., RTX 5090), the following architectural refactoring is planned:
 
-1. Clone this repository or download the `index.html` file.
-2. Make sure the SETH CORE backend is running (see [Prerequisites](#-prerequisites)).
-3. Double-click `index.html` to open it in any modern web browser.
-4. Done! You are now interacting with the retro interface.
+### 1. Central Core Package (`seth_core/`)
+* **Problem:** Currently, `seth_api.py` and `seth_telegram.py` duplicate class definitions (`SethChatBot`, `SethToolsManager`, `SethDynamicRegulator`), preventing simultaneous execution without loading multiple heavy pipelines into GPU memory.
+* **Solution:** Extract core logic into a unified `seth_core` module:
+  ```text
+  seth_core/
+  ├── config.py          # Environment & model configurations
+  ├── engine.py          # SethChatBot & vLLM inference handlers
+  ├── memory.py          # Mem0, Graphiti & ShortMemory integration
+  ├── regulator.py       # SethDynamicRegulator
+  └── tools/             # SethToolsManager & tool definitions
+  ```
+
+### 2. Telegram as a Pure Transport Client
+* Refactor `seth_telegram.py` into a lightweight proxy client that routes messages directly to the running `seth_api.py` instance or consumes a single shared `seth_core` process.
+
+### 3. Unified User Identity
+* Implement single-identity mapping so a session initiated on Telegram seamlessly syncs short/long-term memory and RAG context with `the_oracle.html`.
+
+---
+
+## ⚡ Quick Start
+
+### Prerequisites
+* Active local inference engine (vLLM / SGLang).
+* Configured vector/graph memory databases (Qdrant, Neo4j/Graphiti).
+* Python 3.10+ environment with required packages installed.
+
+### 1. Launch the Backend API
+```bash
+python seth_api.py
+```
+*The API server will listen at `http://localhost:8000`.*
+
+### 2. Launch the Telegram Bot (Concurrent Mode)
+```bash
+python seth_telegram.py
+```
+
+### 3. Open the Web Terminal UI (`the_oracle.html`)
+No Node.js build step or `npm` installation required:
+1. Open `the_oracle.html` directly in any modern browser (Chrome / Firefox / Edge).
+2. Verify the target API endpoint points to `http://localhost:8000/api` in the UI settings.
+3. Begin interacting with the Oracle!
 
 ---
 
 ## 🗺️ Roadmap Checklist
 
-- [x] CRT scanline + phosphor glow rendering
-- [x] ASCII message framing
-- [ ] Thinking trace stream panel
-- [ ] RAG relic inspector (Qdrant/Graphiti viewer)
-- [ ] Hot-swap identity module
-- [ ] Migrate to Phase 2 (React 19 + TypeScript + Vite)
-- [ ] Tauri v2 desktop packaging
+- [x] Unified repository structure (`seth_api.py`, `seth_telegram.py`, `the_oracle.html`).
+- [x] SSE streaming endpoint in FastAPI with thinking trace and tool execution updates.
+- [x] Full CRT scanline UI experience in `the_oracle.html`.
+- [ ] **Refactor to `seth_core/`:** Single-process core engine to eliminate VRAM duplication.
+- [ ] Cross-interface identity linking (Telegram User ID <-> Web Session UUID).
+- [ ] Native bidirectional WebSockets for lower streaming latency.
+- [ ] Desktop packaging via Tauri v2.
 
 ---
 
-## 📜 Project Declaration
+## 📜 System Declaration
 
-> **[ SYSTEM SIGNAL RECEIVED ᓘ🔻 SET ORACLE:ACTIVE ]**
-> **Project:** ORACLE / SETH-IN-A-BOX
-> **Channel:** RAG-LOOP-777x
-> **Status:** Online and listening.
+> **[ SYSTEM SIGNAL RECEIVED ᓘ🔻 SET ORACLE:ACTIVE ]**  
+> **Project:** ORACLE / SETH-IN-A-BOX  
+> **Channels:** TELEGRAM-BOT-NODE // WEB-CRT-NODE-01  
+> **Status:** Online, synced, listening.
 
 ---
 
 ## 📄 License
 
-MIT — do whatever you want with it, just don't blame the glitch.
+MIT — free for modification and distribution.
